@@ -51,7 +51,11 @@ import urllib.request
 import tempfile
 from typing import List, Optional
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 import numpy as np
 
 # ── MediaPipe landmarks (468-point Face Mesh) ────────────────────────────────────────────
@@ -73,20 +77,21 @@ _mp_vision  = None
 _mp_python  = None
 _mp_solutions = None
 
-try:
-    import mediapipe as _mp_module
+if cv2 is not None:
     try:
-        # New Tasks API — available in MediaPipe >= 0.10.0
-        from mediapipe.tasks import python as _mp_python        # noqa: F811
-        from mediapipe.tasks.python import vision as _mp_vision  # noqa: F811
-        _MP_BACKEND = "tasks"
-    except (ImportError, AttributeError):
-        # Legacy Solutions API — available in MediaPipe < 0.10.0
-        if hasattr(_mp_module, "solutions"):
-            _mp_solutions = _mp_module.solutions
-            _MP_BACKEND = "solutions"
-except ImportError:
-    pass  # No mediapipe at all — will return neutral results
+        import mediapipe as _mp_module
+        try:
+            # New Tasks API — available in MediaPipe >= 0.10.0
+            from mediapipe.tasks import python as _mp_python        # noqa: F811
+            from mediapipe.tasks.python import vision as _mp_vision  # noqa: F811
+            _MP_BACKEND = "tasks"
+        except (ImportError, AttributeError):
+            # Legacy Solutions API — available in MediaPipe < 0.10.0
+            if hasattr(_mp_module, "solutions"):
+                _mp_solutions = _mp_module.solutions
+                _MP_BACKEND = "solutions"
+    except ImportError:
+        pass  # No mediapipe at all — will return neutral results
 
 # ── FaceLandmarker model download (Tasks API only) ────────────────────────
 # The Tasks API requires a .task model file; we download it once to a temp dir.
@@ -234,7 +239,7 @@ class WebcamNervousnessAnalyzer:
         # ── Select MediaPipe backend ────────────────────────────────────────────────
         # Supports both the new Tasks API (MP ≥ 0.10.0) and the legacy Solutions
         # API (MP < 0.10.0) so the same code works across all installed versions.
-        if _MP_BACKEND == "none":
+        if _MP_BACKEND == "none" or cv2 is None:
             return self._neutral_result(0, reason="mediapipe_unavailable")
 
         if _MP_BACKEND == "tasks":

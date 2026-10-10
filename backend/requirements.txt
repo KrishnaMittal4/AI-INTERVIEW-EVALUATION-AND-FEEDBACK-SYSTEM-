@@ -21,6 +21,12 @@ PyJWT>=2.8.0
 pydub>=0.25.1
 numpy>=1.24.0
 
+# Vision & Computer Vision (Headless for cloud servers)
+opencv-python-headless>=4.8.0.76
+
+# PDF Export
+reportlab>=4.0.0
+
 # ----------------------------------------------------------------------
 # OPTIONAL: Heavy Deep Learning / Acoustic Emotion Pipeline
 # Omitted by default to keep Docker / deployment size under 50 MB.
