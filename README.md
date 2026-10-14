@@ -191,6 +191,25 @@ Full cloud transcription → NLP pipeline.
 
 **Response:** Same as `/analyze/text` plus `transcript` field.
 
+### `POST /evaluate`
+Evaluates an interview answer and returns the score breakdown used by the live
+interview results.
+
+**Timing and score fields:**
+- `answer_time_sec` is the measured answer duration in seconds. Send `0` when
+  the duration is unavailable; WPM is then `null` rather than estimated.
+  `answer_mode` is `recorded`, `browser_stt`, or `typed`; typed-answer time is
+  excluded from speaking-pace and time scoring.
+- `grade` is derived from the overall score: A ≥ 4.5, B ≥ 3.5, C ≥ 2.5,
+  D ≥ 1.5, and F below 1.5. Session recommendations use the session average:
+  Strong Yes ≥ 4.0, Yes ≥ 3.2, Maybe ≥ 2.5, otherwise No.
+- `star_coverage` is the fraction of STAR components detected. STAR quality is
+  reported separately as `scores.star_quality_1_5`.
+- `scores.grammar_0_5` is the grammar estimate on a 0–5 scale.
+  `grammar_score` is its normalized 0–1 value for skill-gap reports.
+- `evaluation_mode` indicates whether AI reviewer feedback was available;
+  `score_sources` describes the source of heuristic and behavioral metrics.
+
 ### `GET /questions`
 Returns the question bank by category.
 

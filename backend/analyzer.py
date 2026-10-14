@@ -301,6 +301,29 @@ SCORE_WEIGHTS = dict(knowledge=0.70, emotion=0.15, voice=0.15)
 CONFIDENCE_WEIGHTS = dict(eye=0.25, fluency=0.25, voice=0.35, facial=0.15)
 NERVOUSNESS_FUSION = dict(facial=0.35, voice=0.65)
 
+
+def _grade_for_score(score: float) -> str:
+    if score >= 4.5:
+        return "A"
+    if score >= 3.5:
+        return "B"
+    if score >= 2.5:
+        return "C"
+    if score >= 1.5:
+        return "D"
+    return "F"
+
+
+def _recommendation_for_score(score: float) -> str:
+    if score >= 4.0:
+        return "Strong Yes"
+    if score >= 3.2:
+        return "Yes"
+    if score >= 2.5:
+        return "Maybe"
+    return "No"
+
+
 _TIME_WINDOWS: Dict[str, Dict[str, Tuple]] = {
     "technical":   {"easy": (20,50,120,200), "medium": (35,80,180,300), "hard": (50,110,240,380)},
     "behavioural": {"easy": (20,50,110,180), "medium": (35,75,150,240), "hard": (45,85,180,280)},
@@ -2419,6 +2442,7 @@ Return ONLY valid JSON — no prose, no markdown fences, no extra keys:
             from llm_router import clean_json_response
             result = json.loads(clean_json_response(raw))
             result["_cot_used"] = True   # audit flag — visible in /evaluate nlp_detail
+            result["_evaluation_mode"] = "ai"
             print(f"[analyzer v3 CoT] JSON extraction complete — grade={result.get('grade','?')}, "
                   f"rec={result.get('hr_recommendation','?')}")
             return result
@@ -2477,7 +2501,9 @@ Judge technical answers strictly on accuracy."""
             )
             raw = response.choices[0].message.content.strip()
             from llm_router import clean_json_response
-            return json.loads(clean_json_response(raw))
+            result = json.loads(clean_json_response(raw))
+            result["_evaluation_mode"] = "ai"
+            return result
         except Exception as e:
             print(f"[analyzer v3] Single-shot HR feedback failed: {e}")
             return self._fallback_hr(transcript)
@@ -2492,6 +2518,7 @@ Judge technical answers strictly on accuracy."""
             "coaching_tip": "Add specific numbers and outcomes to strengthen your answer.",
             "annotated_transcript": transcript, "grade": "B",
             "grade_reasoning": "Default grade — configure GROQ_API_KEY for real evaluation.",
+            "_evaluation_mode": "local_estimate",
         }
 
     # ── Legacy NLP helpers (unchanged) ────────────────────────────────────────
@@ -2664,13 +2691,24 @@ Judge technical answers strictly on accuracy."""
 
         # ── Step 6: Final aggregation ─────────────────────────────────────────
         knowledge_sc = full_eval["final_score"]
-        if str(hr_result.get("grade", "")).strip().upper() == "F":
-            # Keep the numeric knowledge score consistent with an explicit failing grade.
-            knowledge_sc = min(knowledge_sc, 1.5)
         emotion_sc   = round(_clamp((1.0 - fused_nervousness) * 5, 1, 5), 2)
         voice_sc     = full_eval["fluency_score"]
         avg_depth    = full_eval["depth_score"]
         session_agg  = aggregate_session_score(knowledge_sc, emotion_sc, voice_sc, avg_depth)
+        overall_score = session_agg["final"]
+        grade = _grade_for_score(overall_score)
+        recommendation = _recommendation_for_score(overall_score)
+        grade_reasoning = (
+            f"Grade {grade} is based on the overall score of {overall_score}/5 "
+            "using the configured score bands."
+        )
+        recommendation_reasoning = (
+            f"{recommendation} is based on the overall score of {overall_score}/5."
+        )
+        evaluation_mode = (
+            "ai" if hr_result.get("_evaluation_mode", "ai") == "ai"
+            else "local_estimate"
+        )
 
         # ── Legacy fields ─────────────────────────────────────────────────────
         filler_data = self._detect_fillers(transcript)
@@ -2704,16 +2742,20 @@ Judge technical answers strictly on accuracy."""
                 "fluency":       full_eval["fluency_score"],
                 "knowledge_1_5": knowledge_sc,
                 "session_final": session_agg["final"],
+                "star_quality_1_5": full_eval["star_score"],
+                "grammar_0_5": full_eval["grammar_score"],
             },
 
-            "grade":           hr_result.get("grade", "B"),
-            "grade_reasoning": hr_result.get("grade_reasoning", ""),
+            "grade":           grade,
+            "grade_reasoning": grade_reasoning,
+            "evaluation_mode": evaluation_mode,
 
             "nlp": {
                 "fillers":             filler_data,
                 "confidence_markers":  conf_data,
                 # STAR v3.0
                 "star_scores":         full_eval["star_scores"],
+                "star_quality_1_5":    full_eval["star_score"],
                 "star_order_bonus":    full_eval["order_bonus"],
                 "star_detail_v3":      full_eval["star_detail_v3"],       # NEW
                 # Word category
@@ -2728,6 +2770,7 @@ Judge technical answers strictly on accuracy."""
                 "depth_detail_v3":     full_eval["depth_detail_v3"],      # NEW
                 # Grammar v3.0
                 "grammar_detail_v3":   full_eval["grammar_detail_v3"],    # NEW
+                "grammar_score_0_5":   full_eval["grammar_score"],
                 # Word category
                 "word_category": {
                     "score":        full_eval["word_cat_score"],
@@ -2789,8 +2832,8 @@ Judge technical answers strictly on accuracy."""
             },
 
             "hr_feedback": {
-                "recommendation": hr_result.get("hr_recommendation", "Maybe"),
-                "reasoning":      hr_result.get("hr_reasoning", ""),
+                "recommendation": recommendation,
+                "reasoning":      recommendation_reasoning,
             },
 
             "annotated_transcript": hr_result.get("annotated_transcript", transcript),

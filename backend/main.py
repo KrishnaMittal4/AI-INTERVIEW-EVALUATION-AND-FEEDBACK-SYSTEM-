@@ -44,7 +44,12 @@ from pydantic import BaseModel
 import httpx
 from io import BytesIO
 
-from analyzer import InterviewAnalyzer, compute_coherence_report
+from analyzer import (
+    InterviewAnalyzer,
+    _grade_for_score,
+    _recommendation_for_score,
+    compute_coherence_report,
+)
 from webcam_analyzer import WebcamNervousnessAnalyzer
 from acoustic_nervousness import acoustic_analyser, AcousticBaseline   # tiered analyser singleton
 from unified_voice_pipeline import UnifiedVoicePipeline, TORCH_OK
@@ -345,9 +350,15 @@ def _count_fillers(text: str) -> int:
     return sum(len(re.findall(r'\b' + re.escape(w) + r'\b', text_lower)) for w in filler_list)
 
 
-def _calc_wpm(text: str, duration_sec: float = 60.0) -> int:
+def _calc_wpm(text: str, duration_sec: float = 0.0) -> Optional[int]:
+    if duration_sec <= 0:
+        return None
     words = len(text.split())
-    return int(words / max(duration_sec / 60, 0.1))
+    return int(words / (duration_sec / 60))
+
+
+def _speech_duration_for_scoring(answer_mode: str, elapsed_sec: float) -> float:
+    return 0.0 if answer_mode == "typed" else max(0.0, elapsed_sec)
 
 
 
@@ -1589,7 +1600,8 @@ async def evaluate_answer(
     q_index: int = Form(default=0),
     role: str = Form(default="Software Engineer"),
     difficulty: str = Form(default="medium"),
-    answer_time_sec: float = Form(default=60.0),
+    answer_time_sec: float = Form(default=0.0),
+    answer_mode: str = Form(default="recorded"),
     webcam_frames: str = Form(default=""),   # JSON array of base64 JPEG strings
     cultural_context: str = Form(default="auto"),  # "auto" | "high-context" | "low-context"
 ):
@@ -1608,6 +1620,10 @@ async def evaluate_answer(
 
     Returns: full scoring dict + nervousness detail + rl_hint
     """
+    if answer_mode not in {"recorded", "browser_stt", "typed"}:
+        raise HTTPException(status_code=422, detail="Unsupported answer mode.")
+    speech_duration_sec = _speech_duration_for_scoring(answer_mode, answer_time_sec)
+
     if not answer.strip():
         raise HTTPException(status_code=400, detail="Answer cannot be empty")
 
@@ -1694,7 +1710,7 @@ async def evaluate_answer(
         question_type          = q_type,
         keywords               = keywords,
         difficulty             = difficulty,
-        duration_s             = answer_time_sec,
+        duration_s             = speech_duration_sec,
         # Facial nervousness v2.0 inputs
         au_intensities         = {},
         blink_rate_per_min     = blink_rate_per_min,
@@ -1791,7 +1807,12 @@ async def evaluate_answer(
     # Bug fix: if session_scores["final"] is missing, recompute from components rather than
     # silently collapsing to scores["overall"] (which equals knowledge — making Overall == Knowledge).
     if session_scores.get("final") is not None:
-        overall_score = float(max(0.5, min(5.0, session_scores["final"])))
+        overall_score = float(max(0.5, min(5.0, round(
+            knowledge_score * 0.70 +
+            max(1.0, min(5.0, (1.0 - fused_nervousness) * 5.0)) * 0.15 +
+            float(scores.get("fluency", 3.0)) * 0.15,
+            2,
+        ))))
     else:
         _emotion_fallback = round(max(1.0, min(5.0, (1.0 - fused_nervousness) * 5.0)), 2)
         _voice_fallback   = scores.get("fluency", 3.0)
@@ -1801,12 +1822,25 @@ async def evaluate_answer(
             _voice_fallback   * 0.15,
             2,
         ))))
+    session_scores["final"] = overall_score
+    grade = _grade_for_score(overall_score)
+    hr_recommendation = _recommendation_for_score(overall_score)
+    grade_reasoning = (
+        f"Grade {grade} is based on the overall score of {overall_score}/5 "
+        "using the configured score bands."
+    )
 
     # ── Legacy helpers (for session storage + RL) ──────────────────────────────
     disc       = _score_disc(answer)
-    star_cov   = _score_star(answer)
+    star_scores = nlp_detail.get("star_scores", {})
+    star_parts = ("Situation", "Task", "Action", "Result")
+    star_cov = (
+        round(sum(bool(star_scores.get(part)) for part in star_parts) / len(star_parts), 2)
+        if all(part in star_scores for part in star_parts)
+        else _score_star(answer)
+    )
     filler_cnt = nlp_detail.get("fillers", {}).get("total_count", _count_fillers(answer))
-    wpm        = _calc_wpm(answer, answer_time_sec)
+    wpm        = _calc_wpm(answer, speech_duration_sec)
 
     # ── RL: Bellman update + next-action selection ────────────────────────────
     # Delegate entirely to RLAdaptiveSequencer:
@@ -1843,7 +1877,10 @@ async def evaluate_answer(
             score       = overall_score,
             nervousness = fused_nervousness,
             star_rate   = star_cov,
-            time_eff    = min(100.0, (word_count / max(answer_time_sec, 1)) * 40),
+            time_eff    = (
+                min(100.0, (word_count / speech_duration_sec) * 40)
+                if speech_duration_sec > 0 else 0.0
+            ),
         )
 
         # Persist hint in session so /next_question reads it without re-running RL
@@ -1875,6 +1912,7 @@ async def evaluate_answer(
         "webcam_nervousness": webcam_result,
         "coaching_tip":       analysis.get("ai_evaluation", {}).get("coaching_tip", ""),
         "answer_time_sec":    answer_time_sec,
+        "answer_mode":        answer_mode,
         "q_index":            q_index,
         "depth_score":        scores.get("depth", 0.0),
         # ── Skill Gap fields ──────────────────────────────────────────────────
@@ -1884,7 +1922,7 @@ async def evaluate_answer(
                               else scores.get("relevance", 50) / 100.0,
         "question_type":      q_type,
         "relevance_score":    scores.get("relevance", 50) / 100.0,
-        "grammar_score":      scores.get("clarity", 50) / 100.0,
+        "grammar_score":      float(scores.get("grammar_0_5", 0.0)) / 5.0,
     }
     if session:
         session.setdefault("answers", []).append(answer_record)
@@ -1902,7 +1940,10 @@ async def evaluate_answer(
             "session_final": session_scores.get("final"),
             "confidence":    scores.get("confidence"),
             "clarity":       scores.get("clarity"),
+            "clarity_is_estimate": True,
             "structure":     scores.get("structure"),
+            "star_quality_1_5": scores.get("star_quality_1_5"),
+            "grammar_0_5":   scores.get("grammar_0_5"),
             "technical":     scores.get("technical"),
             "relevance":     scores.get("relevance"),
             "depth":         scores.get("depth"),
@@ -1911,8 +1952,32 @@ async def evaluate_answer(
         "session_scores": session_scores,
 
         # ── Grade ──────────────────────────────────────────────────────────────
-        "grade":           analysis.get("grade", "B"),
-        "grade_reasoning": analysis.get("grade_reasoning", ""),
+        "grade":           grade,
+        "grade_reasoning": grade_reasoning,
+        "evaluation_mode": analysis.get("evaluation_mode", "local_estimate"),
+        "score_sources": {
+            "confidence": "text marker heuristic",
+            "clarity": "sentence-length heuristic estimate",
+            "grammar": "rule-based language estimate",
+            "star_quality": "STAR scoring rubric",
+            "speaking_pace": (
+                "not measured for typed answers"
+                if answer_mode == "typed"
+                else "transcript words divided by measured answer duration"
+            ),
+            "composure": (
+                "face and acoustic voice signals"
+                if nervousness_d.get("facial_detail", {}).get("available")
+                and nervousness_d.get("facial_detail", {}).get("face_detected")
+                and nervousness_d.get("voice_method", "text_proxy") != "text_proxy"
+                else "face signal and text estimate"
+                if nervousness_d.get("facial_detail", {}).get("available")
+                and nervousness_d.get("facial_detail", {}).get("face_detected")
+                else "voice signal"
+                if nervousness_d.get("voice_method", "text_proxy") != "text_proxy"
+                else "text-only estimate"
+            ),
+        },
 
         # ── Nervousness v2.0 detail ────────────────────────────────────────────
         "nervousness_detail": {
@@ -1933,6 +1998,9 @@ async def evaluate_answer(
         # ── NLP detail ─────────────────────────────────────────────────────────
         "nlp_detail": {
             "star_scores":      nlp_detail.get("star_scores", {}),
+            "star_quality_1_5": nlp_detail.get("star_quality_1_5"),
+            "grammar_score_0_5": nlp_detail.get("grammar_score_0_5"),
+            "grammar_detail":   nlp_detail.get("grammar_detail_v3", {}),
             "disc_dominant":    nlp_detail.get("disc_dominant"),
             "ocean_scores":     nlp_detail.get("ocean_scores", {}),
             "personality_nlp":  nlp_detail.get("personality_nlp"),
@@ -1953,7 +2021,8 @@ async def evaluate_answer(
         "annotated_transcript": analysis.get("annotated_transcript", answer),
         "key_strengths":        analysis.get("ai_evaluation", {}).get("key_strengths", []),
         "improvement_areas":    analysis.get("ai_evaluation", {}).get("improvement_areas", []),
-        "hr_recommendation":    analysis.get("hr_feedback", {}).get("recommendation", "Maybe"),
+        "hr_recommendation":    hr_recommendation,
+        "hr_reasoning":          f"{hr_recommendation} is based on the overall score of {overall_score}/5.",
         "technical_evaluation": analysis.get("ai_evaluation", {}).get("technical_evaluation", ""),
         "ideal_answer":         analysis.get("ai_evaluation", {}).get("ideal_answer", ""),
 
@@ -2445,7 +2514,8 @@ async def generate_report(body: ReportRequest):
     avg_nerv     = round(sum(a.get("nervousness", 0.2) for a in answers) / len(answers), 2)
     avg_star     = round(sum(a.get("star_coverage", 0.5) for a in answers) / len(answers), 2)
     avg_filler   = round(sum(a.get("filler_count", 0) for a in answers) / len(answers), 1)
-    avg_wpm      = round(sum(a.get("wpm", 120) for a in answers) / len(answers))
+    measured_wpm = [a["wpm"] for a in answers if a.get("wpm") is not None]
+    avg_wpm      = round(sum(measured_wpm) / len(measured_wpm)) if measured_wpm else None
 
     # Aggregate DISC
     disc_agg: Dict[str, float] = {}
@@ -2510,23 +2580,17 @@ async def generate_report(body: ReportRequest):
         except Exception as e:
             print(f"[report] Groq HR report failed: {e}")
 
-    if not hr_data:
-        # Fallback rule-based recommendation
-        if avg_score >= 4.0:
-            rec, reasoning = "Strong Yes", f"Candidate consistently scored {avg_score}/5 with strong technical depth and composure."
-        elif avg_score >= 3.2:
-            rec, reasoning = "Yes", f"Candidate averaged {avg_score}/5 — solid performance with room to grow."
-        elif avg_score >= 2.5:
-            rec, reasoning = "Maybe", f"Average score of {avg_score}/5. Mixed performance — recommend a follow-up interview."
-        else:
-            rec, reasoning = "No", f"Score of {avg_score}/5 below threshold. Significant gaps in technical knowledge or communication."
-        hr_data = {
-            "hr_recommendation": rec,
-            "hr_reasoning": reasoning,
-            "top_strength": "Shows effort and engagement throughout the session.",
-            "top_weakness": "Needs to improve answer structure and reduce filler words.",
-            "overall_coaching": "Practice the STAR method and aim for 120–160 WPM with fewer hesitation words.",
-        }
+    rec = _recommendation_for_score(avg_score)
+    hr_data["hr_recommendation"] = rec
+    hr_data["hr_reasoning"] = (
+        f"{rec} is based on the session average score of {avg_score}/5."
+    )
+    hr_data.setdefault("top_strength", "Shows effort and engagement throughout the session.")
+    hr_data.setdefault("top_weakness", "Needs to improve answer structure and reduce filler words.")
+    hr_data.setdefault(
+        "overall_coaching",
+        "Practice the STAR method and aim for a measured speaking pace.",
+    )
 
     return JSONResponse(content={
         **hr_data,

@@ -4542,13 +4542,13 @@ function PageSetup({onStart}){
 // ══════════════════════════════════════════════════════════════════════════════
 //  BROWSER STT
 // ══════════════════════════════════════════════════════════════════════════════
-function BrowserSTT({onTranscript}){
+function BrowserSTT({onTranscript,onStart,onStop}){
   const[listening,setListening]=useState(false);
   const[interim,setInterim]=useState("");
   const recRef=useRef(null);
 
   const toggle=()=>{
-    if(listening){recRef.current?.stop();setListening(false);return;}
+    if(listening){recRef.current?.stop();setListening(false);onStop?.();return;}
     const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
     if(!SR){alert("Browser STT requires Chrome or Edge.");return;}
     const r=new SR();
@@ -4562,9 +4562,9 @@ function BrowserSTT({onTranscript}){
       if(fin)onTranscript(p=>(p+" "+fin).trim());
       setInterim(inter);
     };
-    r.onerror=()=>setListening(false);
-    r.onend=()=>setListening(false);
-    r.start();recRef.current=r;setListening(true);
+    r.onerror=()=>{setListening(false);onStop?.();};
+    r.onend=()=>{setListening(false);onStop?.();};
+    r.start();recRef.current=r;setListening(true);onStart?.();
   };
 
   return(
@@ -5396,6 +5396,8 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const mediaRef=useRef(null);
   const chunksRef=useRef([]);
   const timerRef=useRef(null);
+  const answerStartedAtRef=useRef(null);
+  const elapsedBeforeRef=useRef(0);
 
   // ── Dynamic AI Follow-up / Pushback Answering Studio ──
   const[followUp,setFollowUp]=useState(null); // {follow_up, probe_reason, ideal_follow_up_answer}
@@ -5450,13 +5452,40 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
 
   // Timer
   useEffect(()=>{
-    if(timerOn){timerRef.current=setInterval(()=>setTimer(t=>t+1),1000);}
+    if(timerOn){
+      timerRef.current=setInterval(()=>{
+        const currentElapsed=answerStartedAtRef.current===null
+          ? 0
+          : (Date.now()-answerStartedAtRef.current)/1000;
+        setTimer(Math.floor(elapsedBeforeRef.current+currentElapsed));
+      },250);
+    }
     else clearInterval(timerRef.current);
     return()=>clearInterval(timerRef.current);
   },[timerOn]);
 
-  const startTimer=()=>{setTimer(0);setTimerOn(true);};
-  const stopTimer=()=>setTimerOn(false);
+  const startTimer=useCallback(()=>{
+    if(answerStartedAtRef.current===null)answerStartedAtRef.current=Date.now();
+    setTimerOn(true);
+  },[]);
+  const stopTimer=useCallback(()=>{
+    if(answerStartedAtRef.current!==null){
+      elapsedBeforeRef.current+=(Date.now()-answerStartedAtRef.current)/1000;
+      answerStartedAtRef.current=null;
+    }
+    const elapsed=Math.floor(elapsedBeforeRef.current);
+    setTimer(elapsed);setTimerOn(false);
+    return elapsed;
+  },[]);
+  const resetTimer=useCallback(()=>{
+    answerStartedAtRef.current=null;
+    elapsedBeforeRef.current=0;
+    setTimer(0);setTimerOn(false);
+  },[]);
+  const handleAnswerChange=event=>{
+    if(tab==="type"&&event.target.value.trim())startTimer();
+    setAnswer(event.target.value);
+  };
   const fmtTime=(s)=>`${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
 
   // Whisper record
@@ -5505,7 +5534,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       };
       mr.start();mediaRef.current=mr;setRecording(true);startTimer();stopTTS();
     }catch{alert("Microphone access denied.");}
-  },[session]);
+  },[session,startTimer,stopTimer,stopTTS]);
 
   // FIX: track whether auto-submit is pending after transcription
   const autoSubmitRef=useRef(false);
@@ -5520,7 +5549,8 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const submitWithText=async(answerText)=>{
     const text=(answerText||answer||"").trim();
     if(!text||submitting||evalResult)return;
-    setSubmitting(true);setEvaluationError("");stopTimer();
+    const answerDurationSeconds=stopTimer();
+    setSubmitting(true);setEvaluationError("");
     try{
       const form=new FormData();
       form.append("session_id",session.sessionId);
@@ -5529,7 +5559,8 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       form.append("q_index",qIndex);
       form.append("role",session.role);
       form.append("difficulty",session.difficulty);
-      form.append("answer_time_sec",timer);
+      form.append("answer_time_sec",answerDurationSeconds);
+      form.append("answer_mode",tab==="type"?"typed":tab==="browser"?"browser_stt":"recorded");
       // FIX 2: Read from ref, not state — state may still hold previous render's
       // empty array if the React re-render hasn't flushed yet when submit fires.
       if(webcamFramesRef.current.length>0){
@@ -5584,7 +5615,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
     setAnswer("");
     setRetrying(true);
     setTranscriptionError("");
-    setTimer(0);
+    resetTimer();
     setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
     webcamFramesRef.current=[];
     setWebcamFrames([]);setWebcamResult(null);
@@ -5762,7 +5793,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
         ideal_answer:next.ideal_answer||"",
       });
       setQIndex(i=>i+1);
-      setAnswer("");setEvalResult(null);setEvaluationError("");setRlHint(null);setTimer(0);
+      setAnswer("");setEvalResult(null);setEvaluationError("");setRlHint(null);resetTimer();
       setRetrying(false);setPracticeAttempts([]);
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
@@ -5794,7 +5825,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       });
     }finally{
       setLoading(false);setQIndex(i=>i+1);
-      setAnswer("");setEvalResult(null);setEvaluationError("");setRlHint(null);setTimer(0);
+      setAnswer("");setEvalResult(null);setEvaluationError("");setRlHint(null);resetTimer();
       setRetrying(false);setPracticeAttempts([]);
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
@@ -5808,6 +5839,18 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const qDiff=question?.difficulty||session.difficulty;
   // No code editor — "Technical" = conceptual/architectural only
   const typeColor=["Technical","Conceptual","System Design"].includes(qType)?G.cyan:qType==="Behavioural"?G.violet:G.amber;
+  const facialSignalAvailable=Boolean(
+    evalResult?.nervousness_detail?.facial_detail?.available
+    &&evalResult?.nervousness_detail?.facial_detail?.face_detected
+  );
+  const acousticSignalAvailable=Boolean(
+    evalResult?.nervousness_detail?.voice_method
+    &&evalResult.nervousness_detail.voice_method!=="text_proxy"
+  );
+  const composureLabel=facialSignalAvailable&&acousticSignalAvailable
+    ?"Composure (face + acoustic voice)"
+    :facialSignalAvailable?"Composure (face + text estimate)"
+    :acousticSignalAvailable?"Composure (voice estimate)":"Composure (text estimate)";
 
   const inputTabs=[
     {id:"whisper",label:"🎙 Cloud AI"},
@@ -6090,7 +6133,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
               {answer&&!loading&&(
                 <div style={{marginTop:12}}>
                   <div style={{fontSize:10,color:G.textMut,marginBottom:6,letterSpacing:"0.08em"}}>TRANSCRIPT — EDIT IF NEEDED</div>
-                  <textarea value={answer} onChange={e=>setAnswer(e.target.value)}
+                  <textarea value={answer} onChange={handleAnswerChange}
                     rows={4} style={{width:"100%",padding:"10px 12px",fontSize:13,resize:"vertical"}}/>
                 </div>
               )}
@@ -6101,7 +6144,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
                   {transcriptionError}
                 </div>
               )}
-              <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType} timer={timer} evalResult={evalResult}/>
+              <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType}/>
             </div>
           )}
 
@@ -6109,17 +6152,21 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
           {tab==="browser"&&(
             <div>
               <div style={{fontSize:11,color:G.textMut,marginBottom:10,lineHeight:1.6}}>
-                Web Speech API — Chrome/Edge recommended. Dual-track: live transcript + audio for nervousness model.
+                Web Speech API — Chrome/Edge recommended. Speaking pace is measured while recognition is active; no separate acoustic recording is captured in this mode.
               </div>
-              <BrowserSTT onTranscript={setAnswer}/>
+              <BrowserSTT
+                onTranscript={setAnswer}
+                onStart={startTimer}
+                onStop={stopTimer}
+              />
               {answer&&(
                 <div style={{marginTop:10}}>
                   <div style={{fontSize:10,color:G.textMut,marginBottom:6}}>TRANSCRIPT — EDIT IF NEEDED</div>
-                  <textarea value={answer} onChange={e=>setAnswer(e.target.value)}
+                  <textarea value={answer} onChange={handleAnswerChange}
                     rows={4} style={{width:"100%",padding:"10px 12px",fontSize:13,resize:"vertical"}}/>
                 </div>
               )}
-              <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType} timer={timer} evalResult={evalResult}/>
+              <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType}/>
             </div>
           )}
 
@@ -6127,10 +6174,10 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
           {tab==="type"&&(
             <div>
               <div style={{fontSize:10,color:G.textMut,marginBottom:6}}>YOUR ANSWER</div>
-              <textarea value={answer} onChange={e=>setAnswer(e.target.value)}
+              <textarea value={answer} onChange={handleAnswerChange}
                 rows={6} placeholder="Type a detailed answer here…"
                 style={{width:"100%",padding:"10px 12px",fontSize:13,resize:"vertical"}}/>
-              <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType} timer={timer} evalResult={evalResult}/>
+              <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType}/>
             </div>
           )}
 
@@ -6211,7 +6258,11 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
               <SectionLabel color={G.green}>EVALUATION RESULT</SectionLabel>
               <div style={{display:"flex",alignItems:"center",gap:6}}>
                 <div style={{width:8,height:8,borderRadius:"50%",background:G.green,boxShadow:`0 0 8px ${G.green}`,animation:"pulse 1s infinite"}}/>
-                <span style={{fontSize:9,fontFamily:G.head,color:G.green,letterSpacing:"0.1em"}}>AI SCORED</span>
+                <span style={{fontSize:9,fontFamily:G.head,color:G.green,letterSpacing:"0.1em"}}>
+                  {evalResult.evaluation_mode==="ai"
+                    ?"AI REVIEW · RULE-BASED SCORE"
+                    :"LOCAL ESTIMATE"}
+                </span>
               </div>
             </div>
 
@@ -6219,8 +6270,11 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
             <div style={{display:"flex",justifyContent:"space-around",flexWrap:"wrap",gap:10,marginBottom:18}}>
               <ScoreRing score={evalResult.scores?.overall??evalResult.score??3} label="Overall"/>
               <ScoreRing score={evalResult.scores?.knowledge_1_5??evalResult.knowledge??3} label="Knowledge"/>
-              <ScoreRing score={(evalResult.star_coverage??0.5)*5} label="STAR"/>
-              <ScoreRing score={(1-(evalResult.nervousness??0.2))*5} label="Composure"/>
+              <ScoreRing
+                score={evalResult.scores?.star_quality_1_5??(evalResult.star_coverage??0)*5}
+                label={evalResult.scores?.star_quality_1_5==null?"STAR coverage":"STAR quality"}
+              />
+              <ScoreRing score={(1-(evalResult.nervousness??0.2))*5} label={composureLabel}/>
             </div>
 
             {/* Grade badge */}
@@ -6243,7 +6297,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
 
             {/* STAR badges */}
             <div style={{marginBottom:14}}>
-              <div style={{fontSize:10,color:G.textMut,marginBottom:6,letterSpacing:"0.08em"}}>STAR COVERAGE</div>
+              <div style={{fontSize:10,color:G.textMut,marginBottom:6,letterSpacing:"0.08em"}}>STAR COMPONENT COVERAGE</div>
               <StarBadge coverage={evalResult.star_coverage??0.5}/>
             </div>
 
@@ -6261,7 +6315,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
             {/* Stats */}
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
               {[
-                {label:"WPM",val:evalResult.wpm??150,color:G.cyan},
+                {label:"WPM",val:evalResult.wpm??"N/A",color:evalResult.wpm==null?G.textMut:G.cyan},
                 {label:"Fillers",val:evalResult.filler_count??0,color:(evalResult.filler_count??0)>5?G.red:G.green},
                 {label:"Nervousness",val:`${((evalResult.nervousness??0.2)*100).toFixed(0)}%`,
                   color:(evalResult.nervousness??0.2)>0.6?G.red:(evalResult.nervousness??0.2)>0.35?G.amber:G.green},
@@ -6317,7 +6371,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
                 <div style={{fontSize:13,fontFamily:G.head,fontWeight:700,
                   color:evalResult.hr_recommendation==="Strong Yes"||evalResult.hr_recommendation==="Yes"?G.green:evalResult.hr_recommendation==="Maybe"?G.amber:G.red,
                   whiteSpace:"nowrap"}}>
-                  HR: {evalResult.hr_recommendation}
+                  SCORE-BASED: {evalResult.hr_recommendation}
                 </div>
                 {evalResult.technical_evaluation&&(
                   <div style={{fontSize:11,color:G.textMut,lineHeight:1.5,flex:1}}>
@@ -7863,7 +7917,7 @@ function PageReport({session,answers,incidents=[],onNav}){
   const printReport=()=>{
     const avg=answers.length?answers.reduce((a,x)=>a+(x.score||3),0)/answers.length:0;
     const avgNerv=answers.length?answers.reduce((a,x)=>a+(x.nervousness||0.2),0)/answers.length:0.2;
-    const avgStar=answers.length?answers.reduce((a,x)=>a+(x.star_coverage||0.5),0)/answers.length:0.5;
+    const avgStar=answers.length?answers.reduce((a,x)=>a+(x.star_coverage??0.5),0)/answers.length:0.5;
     const disc=answers.reduce((acc,a)=>{if(a.disc)Object.entries(a.disc).forEach(([k,v])=>{acc[k]=(acc[k]||0)+v;});return acc;},{});
     const discNorm=Object.fromEntries(Object.entries(disc).map(([k,v])=>[k,v/Math.max(answers.length,1)]));
     const recVal=report?.hr_recommendation||(avg>=3.5?"Yes":avg>=2.5?"Maybe":"No");
@@ -7876,7 +7930,7 @@ function PageReport({session,answers,incidents=[],onNav}){
     const qRows=answers.map((a,i)=>{
       const sc=a.score||3;
       const col=scoreHex(sc);
-      const starFilled=Math.round((a.star_coverage||0.5)*4);
+      const starFilled=Math.round((a.star_coverage??0.5)*4);
       const starHtml=starItems.map((x,si)=>
         `<span class="star-box ${si<starFilled?"star-on":"star-off"}">${x}</span>`).join("");
       const badges=[
@@ -8188,7 +8242,7 @@ body{
     const fuFailed=answers.filter(a=>a.followUp&&a.followUp.score!=null&&a.followUp.score<3.5);
     const highFill=answers.filter(a=>(a.filler_count||0)>5);
     const highNv=answers.filter(a=>(a.nervousness||0)>0.6);
-    const lowSt=answers.filter(a=>(a.star_coverage||0.5)<0.5);
+    const lowSt=answers.filter(a=>(a.star_coverage??0.5)<0.5);
     const topics=[...new Set(weakA.map(a=>a.type||"Technical Depth"))].slice(0,4);
     const days=[
       {d:"Day 1–2",icon:"📚",title:"Foundation Review",
@@ -8237,7 +8291,7 @@ body{
 
   const avg=answers.length?answers.reduce((a,x)=>a+(x.score||3),0)/answers.length:0;
   const avgNerv=answers.length?answers.reduce((a,x)=>a+(x.nervousness||0.2),0)/answers.length:0.2;
-  const avgStar=answers.length?answers.reduce((a,x)=>a+(x.star_coverage||0.5),0)/answers.length:0.5;
+  const avgStar=answers.length?answers.reduce((a,x)=>a+(x.star_coverage??0.5),0)/answers.length:0.5;
   const interviewGuidance=getRoleInterviewGuidance(session.role);
 
   // Aggregate DISC
@@ -8268,7 +8322,7 @@ body{
         <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:14,flexWrap:"wrap"}}>
           {[
             {label:"XP EARNED",val:`+${Math.round(avg*100+answers.length*30)} XP`,color:G.green},
-            {label:"STAR AVG",val:`${(answers.reduce((a,x)=>a+(x.star_coverage||0.5),0)/Math.max(answers.length,1)*100).toFixed(0)}%`,color:G.cyan},
+            {label:"STAR AVG",val:`${(answers.reduce((a,x)=>a+(x.star_coverage??0.5),0)/Math.max(answers.length,1)*100).toFixed(0)}%`,color:G.cyan},
           ].map(b=><NeonBadge key={b.label} text={`${b.label} ${b.val}`} color={b.color}/>)}
           {/* v3.0: company pack badge in report header */}
           {session.companyPack&&session.companyPack.key&&session.companyPack.key!=="no_pack"&&(
@@ -8620,7 +8674,7 @@ body{
                 <span style={{fontSize:10,color:G.textMut,background:"rgba(255,255,255,0.05)",padding:"2px 8px",borderRadius:4}}>
                   {a.type||"Technical"}
                 </span>
-                <StarBadge coverage={a.star_coverage||0.5}/>
+                <StarBadge coverage={a.star_coverage??0.5}/>
               </div>
               <span style={{fontSize:16,fontFamily:G.head,fontWeight:700,color:scoreColor(a.score||3)}}>
                 {(a.score||3).toFixed(2)}/5
@@ -8735,7 +8789,7 @@ body{
         const followUpsFailed=answers.filter(a=>a.followUp&&a.followUp.score!=null&&a.followUp.score<3.5);
         const highFillers=answers.filter(a=>(a.filler_count||0)>5);
         const highNerv=answers.filter(a=>(a.nervousness||0)>0.6);
-        const lowStar=answers.filter(a=>(a.star_coverage||0.5)<0.5);
+        const lowStar=answers.filter(a=>(a.star_coverage??0.5)<0.5);
         if(!answers.length)return null;
         const focusTopics=[...new Set(weakAnswers.map(a=>a.type||"Technical Depth"))].slice(0,4);
         const planDays=[
@@ -10643,42 +10697,10 @@ function PageBenchmark(){
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  FEATURE: LIVE ANSWER CONFIDENCE METER
-//  Shows real-time quality signals as the candidate types: word count progress,
-//  keyword hit rate, STAR signal detection, and a composite "readiness" score.
+//  FEATURE: LIVE ANSWER PROGRESS
+//  Shows basic word-count and keyword signals while composing an answer.
 // ══════════════════════════════════════════════════════════════════════════════
-// ── STAR Scaffold config ──────────────────────────────────────────────────────
-const STAR_CONFIG = [
-  {
-    key: "S", label: "Situation", color: "#00d4ff",
-    desc: "Set the scene — when & where",
-    hint: "Start with: \"When I was at…\" or \"In my previous role…\"",
-    regex: /\b(when|situation|context|at \w+ (company|job|role|firm|startup)|was working|were facing|background|previously|last (year|month|job|role)|at the time)\b/i,
-  },
-  {
-    key: "T", label: "Task", color: "#a78bfa",
-    desc: "Your specific responsibility",
-    hint: "Try: \"My task was to…\" or \"I was responsible for…\"",
-    regex: /\b(task|goal|objective|needed to|had to|responsible for|challenge|my role|assigned|expected to|requirement|asked to)\b/i,
-  },
-  {
-    key: "A", label: "Action", color: "#00ff88",
-    desc: "What YOU did — use \"I\", not \"we\"",
-    hint: "Use: \"I decided to…\", \"I built…\", \"My approach was…\"",
-    regex: /\b(so i|i decided|i then|i implemented|i built|i created|i led|i worked|i took|i introduced|i approached|my approach|i started|i began|action|step|i used|i applied)\b/i,
-  },
-  {
-    key: "R", label: "Result", color: "#fbbf24",
-    desc: "Measurable outcome & what you learned",
-    hint: "Quantify it: \"reduced by 30%\", \"shipped on time\", \"team improved…\"",
-    regex: /\b(result|outcome|impact|achieved|improved|reduced|increased|as a result|learned|delivered|saved|grew|launched|shipped|cut|boosted|raised|we (hit|met|exceeded)|feedback was)\b/i,
-  },
-];
-
-function LiveConfidenceMeter({ answer, keywords = [], questionType = "Technical", timer = 0, evalResult = null }) {
-  const [nudgeDismissed, setNudgeDismissed] = useState(false);
-  const [prevStarHits, setPrevStarHits]     = useState(0);
-  const [justLit, setJustLit]               = useState(null); // key of element that just lit up
+function LiveConfidenceMeter({ answer, keywords = [], questionType = "Technical" }) {
 
   const words  = answer.trim() ? answer.trim().split(/\s+/).filter(Boolean) : [];
   const wc     = words.length;
@@ -10691,39 +10713,10 @@ function LiveConfidenceMeter({ answer, keywords = [], questionType = "Technical"
   const hits  = keywords.filter(k => lower.includes(k.toLowerCase())).length;
   const kwPct = keywords.length ? Math.min(100, (hits / Math.max(keywords.length, 1)) * 100) : 0;
 
-  const isBehavioural = questionType === "Behavioural" || questionType === "HR";
-
-  // STAR detection
-  const starDetected = {};
-  STAR_CONFIG.forEach(s => { starDetected[s.key] = s.regex.test(answer); });
-  const starHits  = Object.values(starDetected).filter(Boolean).length;
-  const starScore = isBehavioural ? starHits / 4 : 0.5;
-
-  // Composite readiness
-  const ready      = Math.round(((wcPct / 100) * 0.45 + (kwPct / 100) * 0.3 + starScore * 0.25) * 100);
+  const ready      = Math.round((wcPct * 0.6) + (kwPct * 0.4));
   const readyColor = ready >= 75 ? G.green : ready >= 45 ? G.amber : G.red;
 
-  // Flash animation when a new STAR element is first detected
-  useEffect(() => {
-    if (starHits > prevStarHits) {
-      const newKey = STAR_CONFIG.find(s => starDetected[s.key] && !Object.keys(starDetected).slice(0, STAR_CONFIG.findIndex(x => x.key === s.key)).every(k => starDetected[k]));
-      // find which key newly lit
-      const litKey = STAR_CONFIG.find(s => starDetected[s.key])?.key;
-      setJustLit(litKey || null);
-      const t = setTimeout(() => setJustLit(null), 900);
-      setPrevStarHits(starHits);
-      return () => clearTimeout(t);
-    }
-  }, [starHits]);
-
-  // Nudge: missing elements with ≤20s left on timer (only if timer is running, i.e. >0)
-  const missingKeys  = STAR_CONFIG.filter(s => !starDetected[s.key]).map(s => s.key);
-  const lowTime      = timer > 0 && timer >= (questionType === "Behavioural" ? 100 : 60);
-  const showNudge    = isBehavioural && lowTime && missingKeys.length > 0 && !nudgeDismissed && !evalResult;
-
-  // Don't render at all if no answer yet and not behavioural (for technical/HR show pre-answer scaffold)
-  const showPreScaffold = isBehavioural && !answer.trim() && !evalResult;
-  if (!answer.trim() && !showPreScaffold) return null;
+  if (!answer.trim()) return null;
 
   return (
     <div style={{
@@ -10744,7 +10737,7 @@ function LiveConfidenceMeter({ answer, keywords = [], questionType = "Technical"
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
           <div style={{ width: 6, height: 6, borderRadius: "50%", background: answer.trim() ? G.green : G.amber, boxShadow: `0 0 6px ${answer.trim() ? G.green : G.amber}`, animation: "pulse 1.6s infinite" }}/>
           <span style={{ fontSize: 9, fontFamily: G.head, color: G.textMut, letterSpacing: "0.16em" }}>
-            {answer.trim() ? "LIVE COACHING" : "ANSWER SCAFFOLD"}
+            "LIVE RESPONSE PROGRESS"
           </span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -10753,105 +10746,10 @@ function LiveConfidenceMeter({ answer, keywords = [], questionType = "Technical"
               {ready}%
             </span>
           )}
-          {isBehavioural && (
-            <span style={{ fontSize: 9, fontFamily: G.mono, color: G.textMut }}>STAR</span>
-          )}
         </div>
       </div>
 
-      {/* ── Nudge banner ── */}
-      {showNudge && (
-        <div style={{
-          display: "flex", alignItems: "center", gap: 10,
-          padding: "8px 14px",
-          background: `rgba(251,191,36,0.07)`,
-          borderBottom: `1px solid ${G.amber}28`,
-          animation: "fadeInFast 0.3s ease",
-        }}>
-          <span style={{ fontSize: 14, flexShrink: 0 }}>⏱</span>
-          <div style={{ flex: 1 }}>
-            <span style={{ fontSize: 10, color: G.amber, fontFamily: G.head, letterSpacing: "0.08em" }}>
-              STILL MISSING: {missingKeys.join(", ")} —{" "}
-            </span>
-            <span style={{ fontSize: 10, color: G.textMut, fontFamily: G.mono }}>
-              {missingKeys.length === 1 && missingKeys[0] === "R"
-                ? "Wrap up with a concrete result or number!"
-                : missingKeys.length === 1 && missingKeys[0] === "S"
-                ? "Open with when/where this happened."
-                : "Cover the missing sections before you submit."}
-            </span>
-          </div>
-          <button onClick={() => setNudgeDismissed(true)} style={{
-            background: "transparent", border: "none", cursor: "pointer",
-            color: G.textMut, fontSize: 12, padding: "2px 6px", flexShrink: 0,
-          }}>✕</button>
-        </div>
-      )}
-
       <div style={{ padding: "10px 14px 12px" }}>
-
-        {/* ── STAR Scaffold (behavioural) ── */}
-        {isBehavioural && (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginBottom: answer.trim() ? 12 : 0 }}>
-            {STAR_CONFIG.map(s => {
-              const lit     = starDetected[s.key];
-              const isJust  = justLit === s.key;
-              return (
-                <div key={s.key} style={{
-                  borderRadius: 8,
-                  border: `1px solid ${lit ? s.color + "55" : "rgba(255,255,255,0.07)"}`,
-                  background: lit
-                    ? `linear-gradient(135deg,${s.color}14,${s.color}06)`
-                    : "rgba(255,255,255,0.02)",
-                  padding: "8px 10px",
-                  transition: "all 0.35s cubic-bezier(0.34,1.56,0.64,1)",
-                  boxShadow: isJust
-                    ? `0 0 18px ${s.color}55, 0 0 6px ${s.color}33`
-                    : lit ? `0 0 10px ${s.color}22` : "none",
-                  transform: isJust ? "scale(1.03)" : "scale(1)",
-                }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-                    <div style={{
-                      width: 22, height: 22, borderRadius: 5, flexShrink: 0,
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      fontFamily: G.head, fontSize: 11, fontWeight: 700,
-                      border: `1.5px solid ${lit ? s.color : "rgba(255,255,255,0.12)"}`,
-                      background: lit ? `${s.color}22` : "transparent",
-                      color: lit ? s.color : G.textDim,
-                      transition: "all 0.3s",
-                      boxShadow: lit ? `0 0 8px ${s.color}50` : "none",
-                    }}>
-                      {lit ? "✓" : s.key}
-                    </div>
-                    <div>
-                      <div style={{ fontSize: 10, fontFamily: G.head, color: lit ? s.color : G.textMut, letterSpacing: "0.08em", lineHeight: 1 }}>
-                        {s.label}
-                      </div>
-                      <div style={{ fontSize: 8, fontFamily: G.mono, color: G.textDim, marginTop: 1 }}>
-                        {s.desc}
-                      </div>
-                    </div>
-                  </div>
-                  {/* Hint shown when NOT yet detected */}
-                  {!lit && (
-                    <div style={{
-                      fontSize: 9, fontFamily: G.mono, color: G.textDim, lineHeight: 1.55,
-                      borderTop: "1px solid rgba(255,255,255,0.04)", paddingTop: 5, marginTop: 2,
-                    }}>
-                      {s.hint}
-                    </div>
-                  )}
-                  {/* Filled indicator when detected */}
-                  {lit && (
-                    <div style={{ fontSize: 9, fontFamily: G.mono, color: s.color, opacity: 0.75 }}>
-                      covered ✓
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
 
         {/* ── Word count bar (shown when answer exists) ── */}
         {answer.trim() && (
@@ -11672,7 +11570,7 @@ function SessionRadarCard({ answers }) {
 
   const radarData = [
     { label: "Clarity",     value: Math.min(1, avg(a => (a.score || 3) / 5)) },
-    { label: "STAR",        value: avg(a => a.star_coverage || 0.5) },
+    { label: "STAR",        value: avg(a => a.star_coverage ?? 0.5) },
     { label: "Calm",        value: 1 - avg(a => a.nervousness || 0.3) },
     { label: "Keywords",    value: avg(a => a.keyword_score != null ? a.keyword_score / 5 : 0.4) },
     { label: "Depth",       value: Math.min(1, avg(a => (a.depth_score || a.score || 3) / 5)) },

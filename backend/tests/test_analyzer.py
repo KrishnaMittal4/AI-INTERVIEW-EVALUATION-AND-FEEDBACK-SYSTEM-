@@ -178,7 +178,7 @@ class TestAnalyzeOrchestration:
         assert result["scores"]["confidence"] < 70
 
     @pytest.mark.asyncio
-    async def test_failing_ai_grade_caps_knowledge_score(self, analyzer, monkeypatch):
+    async def test_numeric_score_controls_grade_not_ai_grade(self, analyzer, monkeypatch):
         answer = (
             "In my previous role, our team faced a serious production outage. "
             "My task was to lead the incident response. I investigated the database, "
@@ -210,6 +210,11 @@ class TestAnalyzeOrchestration:
             duration_s=160,
         )
 
-        assert result["grade"] == "F"
-        assert result["scores"]["knowledge_1_5"] <= 1.5
+        assert result["grade"] == analyzer_module._grade_for_score(result["scores"]["overall"])
+        assert result["scores"]["knowledge_1_5"] > 1.5
+        assert result["hr_feedback"]["recommendation"] == (
+            analyzer_module._recommendation_for_score(result["scores"]["overall"])
+        )
+        assert result["scores"]["star_quality_1_5"] == result["nlp"]["star_quality_1_5"]
+        assert 0 <= result["scores"]["grammar_0_5"] <= 5
         assert result["scores"]["overall"] == result["scores"]["session_final"]

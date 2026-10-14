@@ -6,6 +6,19 @@ import pytest
 import main
 
 
+def test_wpm_is_unavailable_when_answer_duration_is_not_measured():
+    assert main._calc_wpm("one two three", 0) is None
+
+
+def test_wpm_uses_the_measured_duration():
+    assert main._calc_wpm("one two three", 60) == 3
+
+
+def test_typed_answer_duration_is_not_used_as_speaking_pace():
+    assert main._speech_duration_for_scoring("typed", 30) == 0
+    assert main._speech_duration_for_scoring("browser_stt", 30) == 30
+
+
 class FakeGroqClient:
     def __init__(self, content):
         self.chat = SimpleNamespace(
