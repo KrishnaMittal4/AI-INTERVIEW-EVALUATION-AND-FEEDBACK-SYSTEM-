@@ -5,7 +5,7 @@ Run with: pytest tests/ -v
 
 import pytest
 import asyncio
-from analyzer import InterviewAnalyzer
+from analyzer import InterviewAnalyzer, _compute_star_score_v3
 
 
 @pytest.fixture
@@ -41,17 +41,17 @@ class TestFillerDetection:
 class TestConfidenceScoring:
     def test_strong_language_boosts_score(self, analyzer):
         text = "I successfully led a team and delivered a 30% improvement in performance."
-        result = analyzer._score_confidence(text)
+        result = analyzer._score_language_confidence(text)
         assert result["score"] >= 70
 
     def test_weak_language_lowers_score(self, analyzer):
         text = "I think maybe I tried to help, I guess it probably worked sort of."
-        result = analyzer._score_confidence(text)
+        result = analyzer._score_language_confidence(text)
         assert result["score"] <= 40
 
     def test_mixed_language(self, analyzer):
         text = "I implemented the solution, but I think maybe the results could improve."
-        result = analyzer._score_confidence(text)
+        result = analyzer._score_language_confidence(text)
         assert 30 <= result["score"] <= 80
 
 
@@ -61,21 +61,30 @@ class TestStructureScoring:
         text = """When I was working at Acme, I was responsible for reducing server costs.
         I decided to implement a caching layer and migrated to serverless.
         This resulted in a 40% cost reduction."""
-        result = analyzer._score_structure(text, "behavioral")
-        assert result["framework"] == "STAR"
-        assert result["score"] >= 50
+        score, components, _, _ = _compute_star_score_v3(text.lower())
+        assert score >= 3.5
+        assert components["Situation"]
+        assert components["Task"]
+        assert components["Action"]
 
-    def test_technical_framework(self, analyzer):
+    def test_short_answer_does_not_receive_star_structure_credit(self, analyzer):
         text = """The problem with REST is coupling. My approach was GraphQL.
         However, the trade-off is increased query complexity."""
-        result = analyzer._score_structure(text, "technical")
-        assert result["framework"] == "Problem-Solution-Trade-offs"
+        score, components, _, _ = _compute_star_score_v3(text.lower())
+        assert score == 0
+        assert not any(components.values())
 
 
 # ─── Clarity Scoring ─────────────────────────────────────
 class TestClarityScoring:
     def test_ideal_sentence_length(self, analyzer):
-        text = "I led the backend migration to Kubernetes. The team completed it in three months. We achieved zero downtime throughout the process."
+        text = (
+            "I led the backend migration to Kubernetes, coordinating five engineers "
+            "and defining a phased rollout plan. The team completed the migration "
+            "in three months while maintaining service availability for every customer. "
+            "We achieved zero downtime throughout the process and reduced deployment "
+            "time by forty percent."
+        )
         score = analyzer._score_clarity(text)
         assert score >= 60
 
@@ -85,20 +94,19 @@ class TestClarityScoring:
 
 
 # ─── Full Local Analysis ──────────────────────────────────
-class TestLocalAnalysis:
-    def test_full_analysis_returns_all_keys(self, analyzer):
+class TestLocalNlp:
+    def test_local_nlp_returns_expected_metrics(self, analyzer):
         text = "I led a team of five engineers to build a payment system. We used microservices."
-        result = analyzer._local_analysis(text, "technical")
-        assert "overall_score" in result
-        assert "confidence" in result
-        assert "fillers" in result
-        assert "structure" in result
-        assert "clarity_score" in result
+        result = analyzer._run_local_nlp(text, "technical", [], "medium", 0.0)
+        assert {"filler_count", "fluency_sc", "depth_sc", "star_sc", "ocean"} <= result.keys()
 
-    def test_overall_score_in_range(self, analyzer):
+    def test_local_score_dimensions_stay_in_range(self, analyzer):
         text = "I successfully implemented a distributed caching solution using Redis."
-        result = analyzer._local_analysis(text, "technical")
-        assert 0 <= result["overall_score"] <= 100
+        result = analyzer._run_local_nlp(text, "technical", [], "medium", 0.0)
+        assert 1 <= result["fluency_sc"] <= 5
+        assert 1 <= result["depth_sc"] <= 5
+        assert 1 <= result["depth_flu"] <= 5
+        assert -3 <= result["sentiment"] <= 3
 
 
 # ─── Integration (async) ─────────────────────────────────
