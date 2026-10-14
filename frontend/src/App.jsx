@@ -261,6 +261,38 @@ const ROLES = Object.keys(ROLE_DETAILS);
 const ROLE_CATEGORIES = ["All", "Software & Systems", "AI & Data Science", "Cloud & DevOps", "Security & Reliability", "Product & Leadership"];
 const DIFFICULTIES = ["easy","medium","hard","all"];
 
+const getRoleInterviewGuidance = (role) => {
+  const details = ROLE_DETAILS[role] || ROLE_DETAILS["Software Engineer"];
+  const category = details.category;
+  let answerApproach = "Clarify the goal, explain your approach, compare trade-offs, then describe how you would validate the result.";
+
+  if (category === "AI & Data Science") {
+    answerApproach = "State the goal and assumptions, explain the data and method, name the evaluation metric, then cover validation, limitations, and impact.";
+  } else if (category === "Product & Leadership") {
+    answerApproach = "Explain the context and people affected, define the goal, compare options, state your decision, and finish with a measurable outcome.";
+  } else if (category === "Cloud & DevOps" || category === "Security & Reliability") {
+    answerApproach = "Clarify requirements and risks, outline the design or response, cover failure and recovery paths, then explain monitoring and verification.";
+  }
+
+  return {
+    questionTypes: [
+      { label: "Role fundamentals", detail: `Review core areas such as ${details.techSkills.slice(0, 3).join(", ")}.` },
+      { label: "Applied scenarios", detail: details.perspectives.technical },
+      { label: "Design and trade-offs", detail: details.perspectives.architecture },
+      { label: "Behavior and collaboration", detail: details.perspectives.behavioral },
+    ],
+    answerApproach,
+    behavioralApproach: "Use STAR: briefly set the Situation and Task, spend most of your answer on your own Actions, and close with a specific Result or lesson.",
+  };
+};
+
+const INTERVIEW_DAY_TIPS = [
+  { label: "Dress", detail: "Choose clean, comfortable clothing suited to the employer and role; check that it looks neat on camera." },
+  { label: "Posture and framing", detail: "Sit upright with relaxed shoulders, keep your face near the center of the camera, and look toward the camera while making key points." },
+  { label: "Speaking", detail: "Use a steady pace and clear sentences. Pause briefly to organize your thoughts; a short pause is better than rushing." },
+  { label: "Before you join", detail: "Test your camera, microphone, connection, and lighting. Keep water and a copy of your resume nearby, and take one slow breath." },
+];
+
 // ── DESIGN TOKENS ─────────────────────────────────────────────────────────────
 const G = {
   bg:"#080c14", bgCard:"#0d1527", bgPanel:"#101b30",
@@ -3703,12 +3735,12 @@ function PageDashboard({onNav,sessions,xp=0,onXP}){
   ];
   const features=[
     {icon:"🧠",label:"RL Adaptive Sequencer",desc:"Q-learning dynamically tunes question type and complexity in real-time based on candidate performance. Cross-session prior builds tailored mastery.",color:G.violet},
-    {icon:"🎙",label:"Whisper AI + Browser STT",desc:"Enterprise Groq Whisper ASR paired with streaming Browser STT and manual input. Choose your preferred input model per question.",color:G.cyan},
+    {icon:"🎙",label:"Cloud Speech-to-Text",desc:"Gemini audio transcription with Groq Whisper fallback, plus browser speech recognition and manual input.",color:G.cyan},
     {icon:"📊",label:"Speech Acoustic Calibration",desc:"Adaptive pitch variance, pause distribution, and energy analysis calibrated to your baseline voice characteristics rather than brittle dataset weights.",color:G.amber},
     {icon:"⭐",label:"STAR Method Detection",desc:"NLP detects Situation, Task, Action, and Result structure across your answer text with targeted behavioral scoring.",color:G.green},
     {icon:"🏢",label:"DISC Profile Analysis",desc:"Evaluates Dominance, Influence, Steadiness, and Conscientiousness behavioral archetypes across candidate responses.",color:G.cyan},
     {icon:"📷",label:"Webcam Biometric Calibration",desc:"EAR blink-rate, head-pose stability & gaze aversion tracking via MediaPipe 468-pt mesh, calibrated directly to candidate baseline.",color:G.violet},
-    {icon:"📄",label:"HR Feedback + Printable Report",desc:"LLaMA 3.3-70B generates comprehensive coaching tips, executive hiring verdicts, and printable scorecard reports.",color:G.green},
+    {icon:"📄",label:"HR Feedback + Printable Report",desc:"AI-generated coaching tips, hiring feedback, and printable scorecard reports.",color:G.green},
     {icon:"◑",label:"Resume Calibration",desc:"Upload or skip candidate resume. Calibrates interview questions to match real background experience.",color:G.violet,action:()=>onNav("setup")},
     {icon:"📋",label:"Role Intelligence & Skill Matrix",desc:"Deep-dive role specifications, industry technical skill competencies, and multi-perspective interviewer rubrics.",color:G.purple,action:()=>onNav("setup")},
   ];
@@ -3836,6 +3868,8 @@ function PageSetup({onStart}){
   const[resumeMode,setResumeMode]=useState("skip"); // "upload" | "skip"
   const[resume,setResume]=useState("");
   const[resumeFileName,setResumeFileName]=useState("");
+  const[resumeParsed,setResumeParsed]=useState(null);
+  const[resumeParsing,setResumeParsing]=useState(false);
   const[isHrMode,setIsHrMode]=useState(false); // Most important HR Interview Questions Mode
   const[companyPack,setCompanyPack]=useState("no_pack");
   const[loading,setLoading]=useState(false);
@@ -3878,15 +3912,59 @@ function PageSetup({onStart}){
   const filteredRoles=catFilter==="All"?ROLES:ROLES.filter(r=>ROLE_DETAILS[r]?.category===catFilter);
   const currentRoleDetails=ROLE_DETAILS[role]||ROLE_DETAILS["Software Engineer"];
 
-  const handleFileUpload=(e)=>{
+  const handleFileUpload=async(e)=>{
     const file=e.target.files?.[0];
     if(!file)return;
-    setResumeFileName(file.name);
-    const reader=new FileReader();
-    reader.onload=(evt)=>{
-      setResume(evt.target.result||"");
-    };
-    reader.readAsText(file);
+    const extension=file.name.split(".").pop()?.toLowerCase();
+    if(!["pdf","docx","txt"].includes(extension)){
+      setError("Upload a PDF, DOCX, or TXT resume.");
+      e.target.value="";
+      return;
+    }
+    if(file.size>5*1024*1024){
+      setError("Resume file must be 5 MB or smaller.");
+      e.target.value="";
+      return;
+    }
+    setResumeParsing(true);
+    setError("");
+    try{
+      const form=new FormData();
+      form.append("file",file);
+      const response=await authFetch(`${API}/resume/parse`,{method:"POST",body:form});
+      const parsed=await response.json();
+      if(!response.ok){
+        throw new Error(parsed.detail||"The resume could not be parsed.");
+      }
+      const formatField=value=>Array.isArray(value)
+        ?value.map(item=>typeof item==="string"?item:JSON.stringify(item)).join("; ")
+        :typeof value==="string"?value:value?JSON.stringify(value):"";
+      const extractedText=[
+        parsed.summary&&`Summary: ${formatField(parsed.summary)}`,
+        parsed.skills?.length&&`Skills: ${formatField(parsed.skills)}`,
+        parsed.experience?.length&&`Experience: ${formatField(parsed.experience)}`,
+        parsed.projects?.length&&`Projects: ${formatField(parsed.projects)}`,
+        parsed.education?.length&&`Education: ${formatField(parsed.education)}`,
+        parsed.certifications?.length&&`Certifications: ${formatField(parsed.certifications)}`,
+      ].filter(Boolean).join("\n");
+      if(!extractedText.trim()){
+        throw new Error("No usable resume details were extracted. Paste the resume text instead.");
+      }
+      if(extractedText.length>20000){
+        throw new Error("The extracted resume is over 20,000 characters. Paste a shorter version to continue.");
+      }
+      if(JSON.stringify(parsed).length>100000){
+        throw new Error("The parsed resume is too large. Use a shorter resume or paste selected sections.");
+      }
+      setResume(extractedText);
+      setResumeParsed(parsed);
+      setResumeFileName(file.name);
+    }catch(error){
+      setError(error.message||"The resume could not be parsed. Paste the resume text instead.");
+    }finally{
+      setResumeParsing(false);
+      e.target.value="";
+    }
   };
 
   const extractJD=async()=>{
@@ -3916,6 +3994,11 @@ function PageSetup({onStart}){
   };
 
   const start=async()=>{
+    if(resumeParsing){
+      setError("Wait for resume processing to finish before starting.");
+      setStep(2);
+      return;
+    }
     setLoading(true);setError("");
     const effectiveResume=resumeMode==="upload"?resume:"";
     const effectivePack=isHrMode?"startup":companyPack; // HR mode shifts focus to behavioral/leadership
@@ -3925,6 +4008,7 @@ function PageSetup({onStart}){
       form.append("role",role);form.append("difficulty",diff);
       form.append("num_questions",numQ);
       form.append("resume_text",effectiveResume);
+      form.append("resume_parsed_json",effectiveResume&&resumeParsed?JSON.stringify(resumeParsed):"");
       form.append("company_pack",effectivePack);
       const res=await authFetch(`${API}/session/start`,{method:"POST",body:form});
       if(!res.ok)throw new Error((await res.json()).detail||"Failed");
@@ -3936,7 +4020,7 @@ function PageSetup({onStart}){
         syllabus:data.syllabus,
         syllabusWeights:data.syllabus_weights,
         isHrMode,
-        hasResume:resumeMode==="upload"&&!!effectiveResume,
+        hasResume:!!effectiveResume,
       });
     }catch(e){
       // Dev mode fallback questions
@@ -3949,15 +4033,17 @@ function PageSetup({onStart}){
       ];
       const mockTypes=isHrMode?["HR","Behavioural"]:["Technical","Behavioural","HR"];
       const mockType=mockTypes[Math.floor(Math.random()*mockTypes.length)];
-      const qText=isHrMode
+      const qText=mockType==="Aptitude"
+        ?"A project has 120 users and usage grows by 25%. How many users should you plan for next, and how did you calculate it?"
+        :isHrMode
         ? hrQuestions[Math.floor(Math.random()*hrQuestions.length)]
-        : `Walk me through a complex technical system or project you delivered as a ${role}. What trade-offs and challenges did you navigate?`;
+        :`Walk me through a complex technical system or project you delivered as a ${role}. What trade-offs and challenges did you navigate?`;
 
       onStart({role,difficulty:diff,numQuestions:numQ,
         sessionId:"sess-"+Date.now().toString(36),
         companyPack:{key:effectivePack,display_name:isHrMode?"HR & Behavioral Focus":companyPack},
         isHrMode,
-        hasResume:resumeMode==="upload"&&!!effectiveResume,
+        hasResume:!!effectiveResume,
         firstQuestion:{
           question:qText,
           type:isHrMode?"HR":mockType,difficulty:diff,
@@ -4269,7 +4355,9 @@ function PageSetup({onStart}){
 
           {/* ── Resume Option: Upload OR Skip ────────────────────────────── */}
           <div style={{marginBottom:22}}>
-            <div style={{fontSize:11,color:G.textMut,marginBottom:10,fontWeight:600}}>CANDIDATE RESUME CALIBRATION</div>
+            <div style={{fontSize:11,color:G.textMut,marginBottom:10,fontWeight:600}}>
+              CANDIDATE RESUME CALIBRATION
+            </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
               <button type="button" onClick={()=>setResumeMode("upload")} style={{
                 padding:"13px 14px",borderRadius:8,cursor:"pointer",textAlign:"left",
@@ -4304,14 +4392,18 @@ function PageSetup({onStart}){
                     border:"1px solid rgba(16,185,129,0.3)",color:G.green,fontSize:11,
                     fontFamily:G.head,fontWeight:600,cursor:"pointer",display:"inline-block"
                   }}>
-                    📎 Select Document (.pdf, .txt)
-                    <input type="file" accept=".pdf,.txt,.docx" onChange={handleFileUpload} style={{display:"none"}}/>
+                    {resumeParsing?"⏳ Reading resume…":"📎 Select Resume (.pdf, .docx, .txt)"}
+                    <input type="file" accept=".pdf,.txt,.docx" onChange={handleFileUpload} disabled={resumeParsing} style={{display:"none"}}/>
                   </label>
                   {resumeFileName&&<span style={{fontSize:11,color:G.textPri,fontFamily:G.mono}}>✓ {resumeFileName}</span>}
                 </div>
-                <textarea value={resume} onChange={e=>setResume(e.target.value)}
+                <textarea value={resume} onChange={e=>{setResume(e.target.value);setResumeParsed(null);}}
                   rows={4} placeholder="Or paste resume experience text directly here to tailor interview questions…"
+                  maxLength={20000}
                   style={{width:"100%",padding:"10px 12px",fontSize:12,borderRadius:8,background:"#0d1527",border:"1px solid rgba(255,255,255,0.12)",color:"#f8fafc",resize:"vertical"}}/>
+                <div style={{fontSize:10,color:G.textDim,lineHeight:1.55,marginTop:7}}>
+                  Resume text is sent to the configured AI service to create tailored questions. Avoid including sensitive details you do not want processed.
+                </div>
               </div>
             )}
 
@@ -4321,6 +4413,8 @@ function PageSetup({onStart}){
               </div>
             )}
           </div>
+
+          {error&&<div role="alert" style={{color:G.red,fontSize:12,marginBottom:14,padding:"10px 14px",background:`${G.red}12`,borderRadius:8,border:`1px solid ${G.red}30`}}>{error}</div>}
 
           {/* ── Question Count Slider ────────────────────────────────────── */}
           <div style={{marginBottom:24}}>
@@ -4367,13 +4461,17 @@ function PageSetup({onStart}){
             <div style={{padding:"14px",borderRadius:8,background:"rgba(8,16,30,0.65)",border:"1px solid rgba(6,182,212,0.2)"}}>
               <div style={{fontSize:10,color:G.cyan,fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>TARGET ROLE</div>
               <div style={{fontSize:14,fontFamily:G.head,fontWeight:800,color:"#f8fafc"}}>{role}</div>
-              <div style={{fontSize:11,color:G.textDim,marginTop:3}}>{currentRoleDetails.category}</div>
+              <div style={{fontSize:11,color:G.textDim,marginTop:3}}>
+                {currentRoleDetails.category}
+              </div>
             </div>
 
             <div style={{padding:"14px",borderRadius:8,background:"rgba(8,16,30,0.65)",border:"1px solid rgba(139,92,246,0.2)"}}>
               <div style={{fontSize:10,color:G.violet,fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>DIFFICULTY & FORMAT</div>
               <div style={{fontSize:14,fontFamily:G.head,fontWeight:800,color:"#f8fafc"}}>{diff.toUpperCase()} • {numQ} QUESTIONS</div>
-              <div style={{fontSize:11,color:G.textDim,marginTop:3}}>{isHrMode?"HR & STAR Behavioral Focus":"Technical & Architectural"}</div>
+              <div style={{fontSize:11,color:G.textDim,marginTop:3}}>
+                {isHrMode?"HR & STAR Behavioral Focus":"Technical & Architectural"}
+              </div>
             </div>
 
             <div style={{padding:"14px",borderRadius:8,background:"rgba(8,16,30,0.65)",border:"1px solid rgba(16,185,129,0.2)"}}>
@@ -4403,7 +4501,7 @@ function PageSetup({onStart}){
               </div>
               <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:G.textPri}}>
                 <span style={{color:G.green,fontSize:14}}>✓</span>
-                <span>Groq LLaMA 3.3 Dynamic Question Engine</span>
+                <span>AI Dynamic Question Engine</span>
               </div>
               <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:G.textPri}}>
                 <span style={{color:G.green,fontSize:14}}>✓</span>
@@ -4512,6 +4610,7 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
   const[camError,setCamError]=useState("");
   const[frameCount,setFrameCount]=useState(0);
   const[camMuted,setCamMuted]=useState(false);
+  const[faceState,setFaceState]=useState("idle");
 
   // Auto-start camera on mount for live proctoring preview
   useEffect(()=>{
@@ -4522,6 +4621,75 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
     }
     return ()=>stopCam();
   },[camMuted]);
+
+  useEffect(()=>{
+    if(!camOn||camMuted){
+      setFaceState("idle");
+      return;
+    }
+
+    let cancelled=false;
+    let detector=null;
+    let detectionInterval=null;
+    let missingSince=null;
+    let lastVideoTime=-1;
+    setFaceState("loading");
+
+    const initializeFaceDetection=async()=>{
+      try{
+        const{FaceDetector,FilesetResolver}=await import("@mediapipe/tasks-vision");
+        const vision=await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm"
+        );
+        const faceDetector=await FaceDetector.createFromOptions(vision,{
+          baseOptions:{
+            modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+          },
+          runningMode:"VIDEO",
+          minDetectionConfidence:0.55,
+        });
+
+        if(cancelled){
+          faceDetector.close();
+          return;
+        }
+
+        detector=faceDetector;
+        setFaceState("checking");
+        detectionInterval=setInterval(()=>{
+          const video=videoRef.current;
+          if(!video||video.readyState<2||video.currentTime===lastVideoTime)return;
+          lastVideoTime=video.currentTime;
+          try{
+            const detections=detector.detectForVideo(video,performance.now()).detections;
+            if(detections.length===0){
+              missingSince??=Date.now();
+              if(Date.now()-missingSince>=1500)setFaceState("missing");
+            }else{
+              missingSince=null;
+              setFaceState(detections.length>1?"multiple":"visible");
+            }
+          }catch(error){
+            console.warn("Live face detection stopped:",error);
+            clearInterval(detectionInterval);
+            setFaceState("unavailable");
+          }
+        },400);
+      }catch(error){
+        if(!cancelled){
+          console.warn("Live face detection could not be initialized:",error);
+          setFaceState("unavailable");
+        }
+      }
+    };
+
+    initializeFaceDetection();
+    return()=>{
+      cancelled=true;
+      clearInterval(detectionInterval);
+      detector?.close();
+    };
+  },[camOn,camMuted]);
 
   // Frame capture interval during active recording/answering
   useEffect(()=>{
@@ -4572,8 +4740,19 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
     setCamOn(false);
   };
 
-  const ns       = webcamResult?.nervousness_score ?? null;
+  const visualScoreAvailable = Boolean(
+    webcamResult?.face_detected && webcamResult?.nervousness_score != null
+  );
+  const ns       = visualScoreAvailable ? webcamResult.nervousness_score : null;
   const nsColor  = ns==null ? G.textMut : ns>=70 ? G.red : ns>=45 ? G.amber : G.green;
+  const faceGuidance={
+    loading:{text:"Starting private face check…",color:G.cyan},
+    checking:{text:"Checking camera framing…",color:G.cyan},
+    visible:{text:"Face visible — you’re in frame.",color:G.green},
+    missing:{text:"Your face isn’t visible. Move into the frame and face the camera.",color:G.amber},
+    multiple:{text:"More than one face detected. Keep only yourself in frame.",color:G.amber},
+    unavailable:{text:"Live face check is unavailable. You can continue; camera frames are still used only if you submit an answer.",color:G.amber},
+  }[faceState];
 
   return(
     <Card style={{borderColor:`${G.violet}35`,background:`rgba(12,10,30,0.65)`,backdropFilter:G.blur,WebkitBackdropFilter:G.blur}}>
@@ -4630,12 +4809,16 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
           </div>
         )}
 
-        {/* Calibration indicator badge */}
-        <div style={{position:"absolute",bottom:6,left:6,
-          background:"rgba(0,0,0,0.7)",borderRadius:4,padding:"2px 8px",
-          fontSize:8,fontFamily:G.head,color:G.cyan,letterSpacing:"0.06em"}}>
-          ⟳ 468-PT MESH · CALIBRATED
-        </div>
+        {camOn&&faceGuidance&&(
+          <div role="status" aria-live="polite" style={{
+            position:"absolute",bottom:6,left:6,right:6,
+            background:"rgba(0,0,0,0.78)",borderRadius:5,padding:"6px 9px",
+            fontSize:9,fontFamily:G.head,color:faceGuidance.color,lineHeight:1.5,
+            border:`1px solid ${faceGuidance.color}45`,
+          }}>
+            {faceGuidance.text}
+          </div>
+        )}
 
         <canvas ref={canvasRef} style={{display:"none"}}/>
       </div>
@@ -4643,6 +4826,21 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
       {/* Inside Webcam Analysis: Full Biometric Metrics */}
       {webcamResult?(
         <div style={{animation:"fadeIn 0.3s ease"}}>
+          {!visualScoreAvailable?(
+            <div role="status" style={{
+              fontSize:11,color:G.amber,lineHeight:1.6,padding:"9px 10px",
+              borderRadius:6,background:`${G.amber}10`,border:`1px solid ${G.amber}30`,
+            }}>
+              ⚠ {webcamResult.warning||"Face not detected or not enough usable frames. Center your face in the camera with good lighting. Visual nervousness was not scored; overall nervousness still uses voice/text cues."}
+            </div>
+          ):(
+          <>
+          {webcamResult.warning&&(
+            <div role="status" style={{
+              fontSize:10,color:G.amber,lineHeight:1.5,padding:"7px 9px",marginBottom:8,
+              borderRadius:6,background:`${G.amber}10`,border:`1px solid ${G.amber}30`,
+            }}>⚠ {webcamResult.warning}</div>
+          )}
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
             <span style={{fontSize:11,color:G.textMut,fontWeight:600}}>VISUAL NERVOUSNESS</span>
             <span style={{fontSize:16,fontFamily:G.head,fontWeight:800,color:nsColor,textShadow:`0 0 10px ${nsColor}`}}>
@@ -4663,8 +4861,8 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
                 ok:webcamResult.eye_stability>0.6},
               {label:"Head Stability",val:webcamResult.head_stability!=null?`${Math.round(webcamResult.head_stability*100)}%`:"—",
                 ok:webcamResult.head_stability>0.6},
-              {label:"Gaze Alignment",val:webcamResult.gaze_aversion_rate!=null?`${Math.round((1-webcamResult.gaze_aversion_rate)*100)}%`:"—",
-                ok:webcamResult.gaze_aversion_rate<0.35},
+              {label:"Face Visible",val:webcamResult.face_detection_rate!=null?`${Math.round(webcamResult.face_detection_rate*100)}%`:"—",
+                ok:webcamResult.face_detection_rate>=0.8},
             ].map(m=>(
               <div key={m.label} style={{
                 padding:"4px 8px",borderRadius:5,background:m.ok?"rgba(16,185,129,0.08)":"rgba(245,158,11,0.08)",
@@ -4681,11 +4879,13 @@ function WebcamCapture({active, onFramesReady, webcamResult}){
               💡 {webcamResult.coaching_note}
             </div>
           )}
+          </>
+          )}
         </div>
       ):(
         <div style={{fontSize:10,color:G.textMut,lineHeight:1.6,padding:"4px 0"}}>
           <div style={{color:G.cyan,fontWeight:600,marginBottom:2}}>● Proctoring Active</div>
-          Eye-contact, blink frequency, and head posture are tracked in real-time and calibrated to your baseline.
+          Face presence and facial cues are checked after you submit an answer. Missing-face frames are not scored as nervousness.
         </div>
       )}
     </Card>
@@ -4723,6 +4923,39 @@ function IdealAnswerHint({hint}){
       )}
     </div>
   );
+}
+
+function applyKnowledgeScoreRevision(result, score){
+  const knowledgeScore=Math.max(0.5,Math.min(5,Number(score)));
+  const previousKnowledge=Number(
+    result?.scores?.knowledge_1_5??result?.knowledge??result?.score??3
+  );
+  const knowledgeDelta=knowledgeScore-previousKnowledge;
+  const previousSessionScores=result?.session_scores||{};
+  const weights=previousSessionScores.weights||{knowledge:0.70,emotion:0.15,voice:0.15};
+  const overallScore=previousSessionScores.emotion!=null&&previousSessionScores.voice!=null
+    ? knowledgeScore*weights.knowledge+
+      Number(previousSessionScores.emotion)*weights.emotion+
+      Number(previousSessionScores.voice)*weights.voice
+    : Number(result?.scores?.overall??result?.score??3)+knowledgeDelta*0.70;
+  const boundedOverall=Math.max(0.5,Math.min(5,Number(overallScore.toFixed(2))));
+
+  return {
+    ...result,
+    score:boundedOverall,
+    knowledge:knowledgeScore,
+    scores:{
+      ...(result?.scores||{}),
+      knowledge_1_5:knowledgeScore,
+      overall:boundedOverall,
+      session_final:boundedOverall,
+    },
+    session_scores:{
+      ...previousSessionScores,
+      knowledge:knowledgeScore,
+      final:boundedOverall,
+    },
+  };
 }
 
 
@@ -5132,14 +5365,17 @@ function WhiteboardPanel({open,onClose}){
   );
 }
 
-function PageLive({session,onFinish,addAnswer}){
+function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const[question,setQuestion]=useState(session.firstQuestion);
   const[qIndex,setQIndex]=useState(0);
   const[answers,setAnswers]=useState([]);
   const[tab,setTab]=useState("whisper");
   const[answer,setAnswer]=useState("");
   const[loading,setLoading]=useState(false);
+  const[transcriptionError,setTranscriptionError]=useState("");
   const[evalResult,setEvalResult]=useState(null);
+  const[retrying,setRetrying]=useState(false);
+  const[practiceAttempts,setPracticeAttempts]=useState([]);
   const[recording,setRecording]=useState(false);
   const[rlHint,setRlHint]=useState(null);
   const[historyOpen,setHistoryOpen]=useState(false);
@@ -5166,6 +5402,7 @@ function PageLive({session,onFinish,addAnswer}){
   const[followUpAnswer,setFollowUpAnswer]=useState("");
   const[followUpRecording,setFollowUpRecording]=useState(false);
   const[followUpSubmitting,setFollowUpSubmitting]=useState(false);
+  const[followUpTranscriptionError,setFollowUpTranscriptionError]=useState("");
   const[followUpEval,setFollowUpEval]=useState(null);
   const followUpMediaRef=useRef(null);
   const followUpChunksRef=useRef([]);
@@ -5224,6 +5461,7 @@ function PageLive({session,onFinish,addAnswer}){
   // Whisper record
   const startRec=useCallback(async()=>{
     try{
+      setTranscriptionError("");
       const stream=await navigator.mediaDevices.getUserMedia({audio:true});
       const mr=new MediaRecorder(stream);
       chunksRef.current=[];
@@ -5231,29 +5469,37 @@ function PageLive({session,onFinish,addAnswer}){
       mr.onstop=async()=>{
         stream.getTracks().forEach(t=>t.stop());
         stopTimer();
-        const blob=new Blob(chunksRef.current,{type:"audio/webm"});
+        const blob=new Blob(chunksRef.current,{type:mr.mimeType||"audio/webm"});
+        if(!blob.size){
+          setTranscriptionError("No audio was recorded. Check microphone access and try again.");
+          autoSubmitRef.current=false;
+          return;
+        }
         setLoading(true);
         try{
           const form=new FormData();
-          form.append("audio",blob,"rec.webm");
+          const extension=(mr.mimeType||"audio/webm").includes("mp4")?"mp4":"webm";
+          form.append("audio",blob,`rec.${extension}`);
           form.append("session_id",session.sessionId);
           const res=await authFetch(`${API}/transcribe`,{method:"POST",body:form});
-          if(res.ok){
-            const d=await res.json();
-            const transcript=d.transcript||"";
-            setAnswer(transcript);
-            // FIX: auto-submit immediately after transcription if Stop was clicked
-            if(autoSubmitRef.current&&transcript.trim()){
-              autoSubmitRef.current=false;
-              // 350ms delay: allows WebcamCapture useEffect to flush frames into
-              // webcamFramesRef before submitWithText reads it. 100ms was too short
-              // when webcam had captured several frames (useEffect + setState are async).
-              setTimeout(()=>submitWithText(transcript),350);
-            } else {
-              autoSubmitRef.current=false;
-            }
+          const d=await res.json();
+          if(!res.ok)throw new Error(d.detail||`Transcription request failed (${res.status})`);
+          const transcript=(d.transcript||"").trim();
+          if(!transcript)throw new Error("No speech was detected in the recording.");
+          setAnswer(transcript);
+          // FIX: auto-submit immediately after transcription if Stop was clicked
+          if(autoSubmitRef.current){
+            autoSubmitRef.current=false;
+            // 350ms delay: allows WebcamCapture useEffect to flush frames into
+            // webcamFramesRef before submitWithText reads it. 100ms was too short
+            // when webcam had captured several frames (useEffect + setState are async).
+            setTimeout(()=>submitWithText(transcript),350);
           }
-        }catch(e){console.error(e);autoSubmitRef.current=false;}
+        }catch(e){
+          console.error("Transcription failed",e);
+          setTranscriptionError(e.message||"Transcription failed. Try recording again or use Browser STT.");
+          autoSubmitRef.current=false;
+        }
         finally{setLoading(false);}
       };
       mr.start();mediaRef.current=mr;setRecording(true);startTimer();stopTTS();
@@ -5299,26 +5545,22 @@ function PageLive({session,onFinish,addAnswer}){
         keywords:question?.keywords||[],
         type:qType,
         difficulty:qDiff,
-        ...data
+        ...data,
+        ...(practiceAttempts.length>0?{practice_attempts:practiceAttempts}:{})
       };
-      const na2=[...answers,na];
+      const na2=retrying&&answers.length>0
+        ? [...answers.slice(0,-1),na]
+        : [...answers,na];
       setAnswers(na2);setEvalResult(data);
       setNervousness(data.nervousness||0.2);
-      if(data.webcam_nervousness?.nervousness_score!=null){
+      if(data.webcam_nervousness){
         setWebcamResult(data.webcam_nervousness);
-        if(data.webcam_nervousness.faces_detected > 1){
-          setProctoringIncidents(prev=>[...prev,{
-            type:"multiple_faces",
-            label:`Multiple Faces (${data.webcam_nervousness.faces_detected}) Detected`,
-            timestamp:Date.now()-sessionStartRef.current,
-            qIndex:qIndex+1,
-            time:new Date().toLocaleTimeString(),
-          }]);
-        }
       }
       if(data.rl_hint)setRlHint(data.rl_hint);
       if(data.coherence_report?.available)setCoherenceReport(data.coherence_report);
-      addAnswer(na);
+      if(retrying)replaceLastAnswer(na);
+      else addAnswer(na);
+      setRetrying(false);
     }catch(e){
       // graceful fallback — shown when backend is unreachable
       const mock={score:3.2,knowledge:3,star_coverage:0.5,
@@ -5333,14 +5575,34 @@ function PageLive({session,onFinish,addAnswer}){
         keywords:question?.keywords||[],
         type:qType,
         difficulty:qDiff,
-        ...mock
+        ...mock,
+        ...(practiceAttempts.length>0?{practice_attempts:practiceAttempts}:{})
       };
-      setAnswers(a=>[...a,na]);setEvalResult(mock);addAnswer(na);
+      if(retrying){
+        setAnswers(a=>a.length>0?[...a.slice(0,-1),na]:[na]);
+        replaceLastAnswer(na);
+      }else{
+        setAnswers(a=>[...a,na]);
+        addAnswer(na);
+      }
+      setEvalResult(mock);setRetrying(false);
     }finally{setSubmitting(false);}
   };
 
   // Alias so the button still works (no-arg call uses answer state)
   const submit=()=>submitWithText(answer);
+  const retryAnswer=()=>{
+    if(!evalResult||!answer.trim())return;
+    setPracticeAttempts(previous=>[...previous,{answer,result:evalResult}]);
+    setEvalResult(null);
+    setAnswer("");
+    setRetrying(true);
+    setTranscriptionError("");
+    setTimer(0);
+    setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
+    webcamFramesRef.current=[];
+    setWebcamFrames([]);setWebcamResult(null);
+  };
 
   // ── Dynamic AI Follow-up Probe & Interactive Pushback Flow ──
   const fetchFollowUp=async()=>{
@@ -5381,24 +5643,34 @@ function PageLive({session,onFinish,addAnswer}){
 
   const startFollowUpRec=useCallback(async()=>{
     try{
+      setFollowUpTranscriptionError("");
       const stream=await navigator.mediaDevices.getUserMedia({audio:true});
       const mr=new MediaRecorder(stream);
       followUpChunksRef.current=[];
       mr.ondataavailable=e=>followUpChunksRef.current.push(e.data);
       mr.onstop=async()=>{
         stream.getTracks().forEach(t=>t.stop());
-        const blob=new Blob(followUpChunksRef.current,{type:"audio/webm"});
+        const blob=new Blob(followUpChunksRef.current,{type:mr.mimeType||"audio/webm"});
+        if(!blob.size){
+          setFollowUpTranscriptionError("No audio was recorded. Check microphone access and try again.");
+          return;
+        }
         setFollowUpSubmitting(true);
         try{
           const form=new FormData();
-          form.append("audio",blob,"rec_followup.webm");
+          const extension=(mr.mimeType||"audio/webm").includes("mp4")?"mp4":"webm";
+          form.append("audio",blob,`rec_followup.${extension}`);
           form.append("session_id",session.sessionId);
           const res=await authFetch(`${API}/transcribe`,{method:"POST",body:form});
-          if(res.ok){
-            const d=await res.json();
-            setFollowUpAnswer(d.transcript||"");
-          }
-        }catch(e){console.error(e);}
+          const d=await res.json();
+          if(!res.ok)throw new Error(d.detail||`Transcription request failed (${res.status})`);
+          const transcript=(d.transcript||"").trim();
+          if(!transcript)throw new Error("No speech was detected in the recording.");
+          setFollowUpAnswer(transcript);
+        }catch(e){
+          console.error("Follow-up transcription failed",e);
+          setFollowUpTranscriptionError(e.message||"Transcription failed. Try recording again.");
+        }
         finally{setFollowUpSubmitting(false);}
       };
       mr.start();followUpMediaRef.current=mr;setFollowUpRecording(true);stopTTS();
@@ -5505,6 +5777,7 @@ function PageLive({session,onFinish,addAnswer}){
       });
       setQIndex(i=>i+1);
       setAnswer("");setEvalResult(null);setRlHint(null);setTimer(0);
+      setRetrying(false);setPracticeAttempts([]);
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
       setWebcamFrames([]);setWebcamResult(null);
@@ -5521,12 +5794,13 @@ function PageLive({session,onFinish,addAnswer}){
       else throw new Error();
     }catch{
       // mock fallback — Technical = conceptual only (no code editor)
-      const fbTypes=["Technical","Behavioural","HR"];
+      const fbTypes=session.isHrMode?["HR","Behavioural"]:["Technical","Behavioural","HR"];
       const fbType=fbTypes[(qIndex+1)%fbTypes.length];
       const fbQuestions={
         Technical:`Follow-up Q${qIndex+2}: Walk me through the architectural trade-offs you considered in that solution.`,
         Behavioural:`Follow-up Q${qIndex+2}: Tell me about a time you had to collaborate under tight deadlines.`,
         HR:`Follow-up Q${qIndex+2}: How do you handle feedback and what motivates you professionally?`,
+        Aptitude:"A project has 120 users and usage grows by 25%. How many users should you plan for next, and how did you calculate it?",
       };
       setQuestion({
         question:fbQuestions[fbType],
@@ -5535,6 +5809,7 @@ function PageLive({session,onFinish,addAnswer}){
     }finally{
       setLoading(false);setQIndex(i=>i+1);
       setAnswer("");setEvalResult(null);setRlHint(null);setTimer(0);
+      setRetrying(false);setPracticeAttempts([]);
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
       setWebcamFrames([]);setWebcamResult(null);
@@ -5549,10 +5824,19 @@ function PageLive({session,onFinish,addAnswer}){
   const typeColor=["Technical","Conceptual","System Design"].includes(qType)?G.cyan:qType==="Behavioural"?G.violet:G.amber;
 
   const inputTabs=[
-    {id:"whisper",label:"🎙 Whisper AI"},
+    {id:"whisper",label:"🎙 Cloud AI"},
     {id:"browser",label:"🌐 Browser STT"},
     {id:"type",label:"⌨ Type"},
   ];
+  const practiceTip=evalResult?.coaching_tip||evalResult?.improvement_areas?.[0]
+    ||practiceAttempts[practiceAttempts.length-1]?.result?.coaching_tip
+    ||practiceAttempts[practiceAttempts.length-1]?.result?.improvement_areas?.[0]
+    ||"Try a clear structure: set the context, describe what you did, and share the result.";
+  const previousPracticeAttempt=practiceAttempts[practiceAttempts.length-1];
+  const practiceScore=(result)=>{
+    const score=Number(result?.score??result?.knowledge);
+    return Number.isFinite(score)&&score>0?score.toFixed(1):null;
+  };
 
   return(
     <div style={{display:"grid",gridTemplateColumns:"minmax(0, 1fr) 350px",gap:22,animation:"fadeIn 0.4s ease",position:"relative",zIndex:3,maxWidth:"100%"}}>
@@ -5751,6 +6035,21 @@ function PageLive({session,onFinish,addAnswer}){
         {/* Input & Model Selector Card */}
         <Card style={{background:G.glass,backdropFilter:G.blur,WebkitBackdropFilter:G.blur,padding:"20px 22px"}}>
           {recording&&<div style={{height:2,background:`linear-gradient(90deg,transparent,${G.red},transparent)`,marginBottom:0,marginLeft:-22,marginRight:-22,marginTop:-20,borderRadius:"12px 12px 0 0",boxShadow:`0 0 8px ${G.red}`,animation:"pulse 1s infinite"}}/>}
+          {retrying&&(
+            <div style={{padding:"12px 14px",marginBottom:16,borderRadius:8,
+              background:`${G.cyan}0b`,border:`1px solid ${G.cyan}28`}}>
+              <div style={{fontSize:11,color:G.cyan,fontFamily:G.head,fontWeight:700,marginBottom:5}}>
+                PRACTICE ROUND {practiceAttempts.length+1}
+              </div>
+              <div style={{fontSize:12,color:G.textPri,lineHeight:1.6}}>
+                Take your time and try again. Focus on one thing:
+                <span style={{color:G.cyan}}> {practiceTip}</span>
+              </div>
+              <div style={{fontSize:10,color:G.textMut,marginTop:5}}>
+                Practice is for learning—not a verdict. Only your latest attempt counts in the session report.
+              </div>
+            </div>
+          )}
           
           {/* Model Selection Tabs */}
           <div style={{marginBottom:18,marginTop:recording?12:0}}>
@@ -5770,7 +6069,7 @@ function PageLive({session,onFinish,addAnswer}){
             </div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
               {[
-                {id:"whisper",label:"Whisper AI",icon:"🎙",sub:"Cloud ASR · Groq LLaMA"},
+                {id:"whisper",label:"Cloud AI",icon:"🎙",sub:"Gemini → Groq Whisper"},
                 {id:"browser",label:"Browser STT",icon:"🌐",sub:"Real-Time Streaming"},
                 {id:"type",label:"Manual Type",icon:"⌨",sub:"Direct Written Answer"},
               ].map(t=>(
@@ -5797,7 +6096,7 @@ function PageLive({session,onFinish,addAnswer}){
               <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
                 <EQBars active={recording} nervousness={nervousness}/>
                 {recording&&<span style={{fontSize:11,color:G.red,fontFamily:G.mono,animation:"pulse 1s infinite"}}>● REC {fmtTime(timer)}</span>}
-                {loading&&<span style={{fontSize:11,color:G.cyan}}>⚙ Transcribing via Groq Whisper…</span>}
+                {loading&&<span style={{fontSize:11,color:G.cyan}}>⚙ Transcribing via Gemini (Groq Whisper fallback)…</span>}
               </div>
               <Btn onClick={recording?stopRec:startRec} color={recording?G.red:G.green} disabled={loading}>
                 {recording?"⏹ STOP RECORDING":"⏺ RECORD AUDIO"}
@@ -5807,6 +6106,13 @@ function PageLive({session,onFinish,addAnswer}){
                   <div style={{fontSize:10,color:G.textMut,marginBottom:6,letterSpacing:"0.08em"}}>TRANSCRIPT — EDIT IF NEEDED</div>
                   <textarea value={answer} onChange={e=>setAnswer(e.target.value)}
                     rows={4} style={{width:"100%",padding:"10px 12px",fontSize:13,resize:"vertical"}}/>
+                </div>
+              )}
+              {transcriptionError&&(
+                <div role="alert" style={{marginTop:10,padding:"8px 10px",borderRadius:6,
+                  background:`${G.red}0c`,border:`1px solid ${G.red}35`,
+                  color:G.red,fontSize:11,lineHeight:1.5}}>
+                  {transcriptionError}
                 </div>
               )}
               <LiveConfidenceMeter answer={answer} keywords={question?.keywords||[]} questionType={qType} timer={timer} evalResult={evalResult}/>
@@ -5848,7 +6154,7 @@ function PageLive({session,onFinish,addAnswer}){
                 disabled={submitting||!answer.trim()}
                 full color={submitting?G.amber:G.green}
                 style={{padding:"12px 20px",fontSize:14,letterSpacing:"0.1em",borderRadius:9}}>
-                {submitting?"⚙ EVALUATING WITH GROQ LLaMA…":"⚡ SUBMIT ANSWER"}
+                {submitting?"⚙ EVALUATING ANSWER…":"⚡ SUBMIT ANSWER"}
               </Btn>
             ):(
               <div style={{padding:"10px 14px",background:`${G.green}0a`,borderRadius:8,
@@ -5873,7 +6179,7 @@ function PageLive({session,onFinish,addAnswer}){
                 ))}
               </div>
               <div style={{flex:1}}>
-                <div style={{fontSize:12,color:G.cyan,fontWeight:700,fontFamily:G.head,letterSpacing:"0.06em"}}>EVALUATING WITH GROQ LLaMA 3.3-70B</div>
+                <div style={{fontSize:12,color:G.cyan,fontWeight:700,fontFamily:G.head,letterSpacing:"0.06em"}}>EVALUATING ANSWER</div>
                 <div style={{fontSize:10,color:G.textMut,marginTop:3}}>NLP scoring + HR feedback generation · 5–12 s</div>
                 <div style={{marginTop:8,height:2,background:G.bgPanel,borderRadius:1,overflow:"hidden"}}>
                   <div style={{height:"100%",width:"60%",borderRadius:1,background:`linear-gradient(90deg,${G.cyan},${G.green},${G.violet})`,backgroundSize:"200%",animation:"shimmer 1.5s linear infinite"}}/>
@@ -5886,6 +6192,28 @@ function PageLive({session,onFinish,addAnswer}){
 
         {evalResult&&(
           <Card glow style={{borderColor:`${G.green}28`,background:G.glass,backdropFilter:G.blur,WebkitBackdropFilter:G.blur}}>
+            <div style={{padding:"13px 15px",marginBottom:16,borderRadius:9,
+              background:`${G.cyan}0b`,border:`1px solid ${G.cyan}28`}}>
+              <div style={{fontSize:10,color:G.cyan,fontFamily:G.head,fontWeight:700,
+                letterSpacing:"0.1em",marginBottom:6}}>ONE THING TO PRACTICE</div>
+              <div style={{fontSize:12,color:G.textPri,lineHeight:1.65}}>{practiceTip}</div>
+              <div style={{fontSize:10,color:G.textMut,lineHeight:1.55,marginTop:6}}>
+                Feedback is a practice aid, not a judgment of your ability. You can retry whenever you’re ready.
+              </div>
+              {previousPracticeAttempt&&(
+                <div style={{fontSize:11,color:G.textMut,marginTop:9}}>
+                  Previous try{practiceScore(previousPracticeAttempt.result)
+                    ? `: ${practiceScore(previousPracticeAttempt.result)}/5`
+                    : ""}{" · "}This try{practiceScore(evalResult)
+                    ? `: ${practiceScore(evalResult)}/5`
+                    : ""}. Use the feedback as a guide, not a target score.
+                </div>
+              )}
+              <Btn onClick={retryAnswer} color={G.cyan}
+                style={{fontSize:11,padding:"7px 12px",marginTop:11,borderRadius:7}}>
+                ↻ PRACTICE THIS ANSWER AGAIN
+              </Btn>
+            </div>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
               <SectionLabel color={G.green}>EVALUATION RESULT</SectionLabel>
               <div style={{display:"flex",alignItems:"center",gap:6}}>
@@ -5976,7 +6304,7 @@ function PageLive({session,onFinish,addAnswer}){
                   <div style={{padding:"10px 12px",background:`${G.amber}08`,borderRadius:6,
                     border:`1px solid ${G.amber}20`}}>
                     <div style={{fontSize:9,color:G.amber,letterSpacing:"0.1em",marginBottom:6}}>IMPROVE</div>
-                    {evalResult.improvement_areas.slice(0,3).map((a,i)=>(
+                    {evalResult.improvement_areas.slice(0,1).map((a,i)=>(
                       <div key={i} style={{fontSize:11,color:G.textPri,lineHeight:1.55,marginBottom:3,
                         paddingLeft:10,position:"relative"}}>
                         <span style={{position:"absolute",left:0,color:G.amber}}>→</span>{a}
@@ -6015,6 +6343,17 @@ function PageLive({session,onFinish,addAnswer}){
               </div>
             )}
 
+            {(evalResult.ideal_answer||question?.ideal_answer)&&(
+              <div style={{padding:"12px 14px",background:`${G.amber}08`,borderRadius:8,
+                border:`1px solid ${G.amber}25`,marginBottom:14}}>
+                <div style={{fontSize:9,color:G.amber,fontFamily:G.head,
+                  letterSpacing:"0.1em",marginBottom:6}}>REFERENCE ANSWER · COMPARE WITH YOUR RESPONSE</div>
+                <div style={{fontSize:11,color:G.textPri,lineHeight:1.7}}>
+                  {evalResult.ideal_answer||question?.ideal_answer}
+                </div>
+              </div>
+            )}
+
             {/* ── FEEDBACK ENGINE: Conflict + Dialogic ── */}
             <AuraFeedbackSuite
               analysisResult={evalResult}
@@ -6022,7 +6361,16 @@ function PageLive({session,onFinish,addAnswer}){
               questionType={qType}
               apiBase={API}
               onScoreRevised={(newScore)=>{
-                setEvalResult(prev=>prev?{...prev,scores:{...(prev.scores||{}),knowledge_1_5:newScore},score:newScore}:prev);
+                setEvalResult(prev=>(
+                  prev&&prev.q_index===qIndex
+                    ? applyKnowledgeScoreRevision(prev,newScore)
+                    : prev
+                ));
+                setAnswers(prev=>prev.map((item,index)=>(
+                  index===prev.length-1&&item.q_index===qIndex
+                    ? applyKnowledgeScoreRevision(item,newScore)
+                    : item
+                )));
               }}
             />
 
@@ -6115,6 +6463,11 @@ function PageLive({session,onFinish,addAnswer}){
                           resize:"vertical",fontFamily:"inherit"
                         }}
                       />
+                      {followUpTranscriptionError&&(
+                        <div role="alert" style={{marginTop:8,color:G.red,fontSize:11,lineHeight:1.5}}>
+                          {followUpTranscriptionError}
+                        </div>
+                      )}
 
                       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:10,flexWrap:"wrap",gap:10}}>
                         <span style={{fontSize:10,color:G.textMut,fontFamily:G.mono}}>
@@ -6295,8 +6648,8 @@ function PageLive({session,onFinish,addAnswer}){
           {[
             {label:"Role",val:session.role,color:G.cyan},
             {label:"Difficulty",val:session.difficulty.toUpperCase(),color:session.difficulty==="hard"?G.red:session.difficulty==="easy"?G.green:G.amber},
-            {label:"LLM",val:"LLaMA 3.3-70B",color:G.violet},
-            {label:"ASR",val:"Groq Whisper",color:G.cyan},
+            {label:"LLM",val:"Groq · GPT-OSS-120B",color:G.violet},
+            {label:"ASR",val:"Gemini → Groq",color:G.cyan},
             {label:"RL",val:"Q-learning v2.0",color:G.green},
           ].map(r=>(
             <div key={r.label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
@@ -6314,14 +6667,6 @@ function PageLive({session,onFinish,addAnswer}){
     </div>
   );
 }
-// ══════════════════════════════════════════════════════════════════════════════
-//  PAGE: FINAL REPORT
-// ══════════════════════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════════════════════
-//  RESUME GAP CARD
-//  Shows which resume claims were covered, partially covered, or missed
-//  during the interview. Data comes from report.resume_gap (analyze_gap()).
-// ══════════════════════════════════════════════════════════════════════════════
 function ResumeGapCard({ gap }) {
   const [tab, setTab] = React.useState("uncovered");
   const [expanded, setExpanded] = React.useState({});
@@ -7533,6 +7878,7 @@ function PageReport({session,answers,incidents=[],onNav}){
     const scoreHex=(s,mx=5)=>{const r=s/mx;return r>=0.84?"#00ff88":r>=0.70?"#00d4ff":r>=0.50?"#fbbf24":"#ff3366";};
     const discColor=(k)=>k==="Dominance"?"#ff3366":k==="Influence"?"#00d4ff":k==="Steadiness"?"#00ff88":"#a78bfa";
     const starItems=["S","T","A","R"];
+    const escapeHtml=(value)=>String(value).replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 
     const qRows=answers.map((a,i)=>{
       const sc=a.score||3;
@@ -7602,6 +7948,24 @@ function PageReport({session,answers,incidents=[],onNav}){
           <div class="ring-label">${label}</div>
         </div>`;
     }).join("");
+
+    const interviewGuidance=getRoleInterviewGuidance(session.role);
+    const rolePrepBlock=`
+      <div class="section">
+        <div class="section-label" style="border-color:#06b6d4;color:#06b6d4;">ROLE PREPARATION & INTERVIEW-DAY TIPS</div>
+        <div style="font-size:10px;color:#64748b;margin-bottom:8px;">General guidance for ${escapeHtml(session.role)}; actual interview questions vary by employer and interviewer.</div>
+        ${interviewGuidance.questionTypes.map(item=>`
+          <div style="padding:7px 9px;margin:5px 0;border:1px solid #e2e8f0;border-radius:5px;background:#fafafa;">
+            <b style="color:#0e7490;">${escapeHtml(item.label)}:</b> ${escapeHtml(item.detail)}
+          </div>`).join("")}
+        <div style="padding:8px 10px;margin-top:8px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:5px;">
+          <b>Answer structure:</b> ${escapeHtml(interviewGuidance.answerApproach)}
+          <br/><b>Behavioral examples:</b> ${escapeHtml(interviewGuidance.behavioralApproach)}
+        </div>
+        <div style="margin-top:8px;"><b>Interview-day checklist</b></div>
+        ${INTERVIEW_DAY_TIPS.map(({label,detail})=>`
+          <div style="padding:5px 0;border-bottom:1px solid #eee;"><b>${escapeHtml(label)}:</b> ${escapeHtml(detail)}</div>`).join("")}
+      </div>`;
 
     const rlBlock=report?.rl_report?`
       <div class="section">
@@ -7784,6 +8148,8 @@ body{
     </div>
   </div>
 
+  ${rolePrepBlock}
+
   <!-- PROCTORING AUDIT DOSSIER -->
   <div class="section">
     <div class="section-label" style="border-color:${incidents.length===0?"#16a34a":"#d97706"};color:${incidents.length===0?"#16a34a":"#d97706"}">
@@ -7879,6 +8245,7 @@ body{
   const avg=answers.length?answers.reduce((a,x)=>a+(x.score||3),0)/answers.length:0;
   const avgNerv=answers.length?answers.reduce((a,x)=>a+(x.nervousness||0.2),0)/answers.length:0.2;
   const avgStar=answers.length?answers.reduce((a,x)=>a+(x.star_coverage||0.5),0)/answers.length:0.5;
+  const interviewGuidance=getRoleInterviewGuidance(session.role);
 
   // Aggregate DISC
   const disc=answers.reduce((acc,a)=>{
@@ -8066,6 +8433,48 @@ body{
           </div>
         </Card>
       )}
+
+      {/* ROLE-SPECIFIC PREPARATION */}
+      <Card style={{marginBottom:16,borderColor:`${G.cyan}28`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:8}}>
+          <SectionLabel color={G.cyan}>Role Preparation & Interview-Day Tips</SectionLabel>
+          <span style={{fontSize:9,color:G.textMut}}>General guidance; actual questions vary by employer.</span>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:14}}>
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:G.textPri,marginBottom:8}}>Question types to prepare for · {session.role}</div>
+            {interviewGuidance.questionTypes.map(item=>(
+              <div key={item.label} style={{padding:"8px 10px",marginBottom:7,borderRadius:7,
+                background:"rgba(6,182,212,0.04)",border:`1px solid ${G.cyan}18`}}>
+                <div style={{fontSize:10,color:G.cyan,fontWeight:700,marginBottom:3}}>{item.label}</div>
+                <div style={{fontSize:11,color:G.textMut,lineHeight:1.65}}>{item.detail}</div>
+              </div>
+            ))}
+            <div style={{padding:"9px 11px",borderRadius:7,background:"rgba(139,92,246,0.06)",
+              border:`1px solid ${G.violet}25`,fontSize:11,color:G.textMut,lineHeight:1.7}}>
+              <div style={{color:G.violet,fontWeight:700,marginBottom:3}}>How to structure answers</div>
+              <div><b style={{color:G.textPri}}>Role questions:</b> {interviewGuidance.answerApproach}</div>
+              <div style={{marginTop:5}}><b style={{color:G.textPri}}>Behavioral examples:</b> {interviewGuidance.behavioralApproach}</div>
+            </div>
+          </div>
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:G.textPri,marginBottom:8}}>Interview-day confidence checklist</div>
+            {INTERVIEW_DAY_TIPS.map((tip,index)=>(
+              <div key={tip.label} style={{display:"flex",gap:9,padding:"9px 10px",marginBottom:7,
+                borderRadius:7,background:"rgba(255,255,255,0.025)",border:`1px solid ${G.border}`}}>
+                <span style={{fontSize:11,color:G.green,fontWeight:700}}>{String(index+1).padStart(2,"0")}</span>
+                <div>
+                  <div style={{fontSize:10,color:G.textPri,fontWeight:700,marginBottom:3}}>{tip.label}</div>
+                  <div style={{fontSize:11,color:G.textMut,lineHeight:1.65}}>{tip.detail}</div>
+                </div>
+              </div>
+            ))}
+            <div style={{fontSize:10,color:G.textDim,lineHeight:1.6,marginTop:5}}>
+              These are practical preparation suggestions, not predictions about a specific company's interview process.
+            </div>
+          </div>
+        </div>
+      </Card>
 
       {/* RL REPORT */}
       {report?.rl_report&&(
@@ -9138,6 +9547,7 @@ function AnswerInputPanel({value, onChange, onSubmit, submitLabel="⚡ SUBMIT AN
   const[inputTab,setInputTab]=useState("whisper");
   const[recording,setRecording]=useState(false);
   const[transcribing,setTranscribing]=useState(false);
+  const[transcriptionError,setTranscriptionError]=useState("");
   const[listening,setListening]=useState(false);
   const[interim,setInterim]=useState("");
   const mediaRef=useRef(null);
@@ -9145,7 +9555,7 @@ function AnswerInputPanel({value, onChange, onSubmit, submitLabel="⚡ SUBMIT AN
   const sttRef=useRef(null);
 
   const inputTabs=[
-    {id:"whisper",label:"🎙 Whisper AI"},
+    {id:"whisper",label:"🎙 Cloud AI"},
     {id:"browser",label:"🌐 Browser STT"},
     {id:"type",   label:"⌨ Type"},
   ];
@@ -9153,24 +9563,34 @@ function AnswerInputPanel({value, onChange, onSubmit, submitLabel="⚡ SUBMIT AN
   // ── Whisper (Groq) ────────────────────────────────────────────────────────
   const startWhisper=async()=>{
     try{
+      setTranscriptionError("");
       const stream=await navigator.mediaDevices.getUserMedia({audio:true});
       const mr=new MediaRecorder(stream);
       chunksRef.current=[];
       mr.ondataavailable=e=>chunksRef.current.push(e.data);
       mr.onstop=async()=>{
         stream.getTracks().forEach(t=>t.stop());
-        const blob=new Blob(chunksRef.current,{type:"audio/webm"});
+        const blob=new Blob(chunksRef.current,{type:mr.mimeType||"audio/webm"});
+        if(!blob.size){
+          setTranscriptionError("No audio was recorded. Check microphone access and try again.");
+          return;
+        }
         setTranscribing(true);
         try{
           const form=new FormData();
-          form.append("audio",blob,"rec.webm");
+          const extension=(mr.mimeType||"audio/webm").includes("mp4")?"mp4":"webm";
+          form.append("audio",blob,`rec.${extension}`);
           // reuse existing /transcribe route — no session_id needed for HR/bench
           const res=await authFetch(`${API}/transcribe`,{method:"POST",body:form});
-          if(res.ok){
-            const d=await res.json();
-            if(d.transcript)onChange(prev=>(prev?prev+" ":"")+d.transcript.trim());
-          }
-        }catch(e){console.error("Whisper error",e);}
+          const d=await res.json();
+          if(!res.ok)throw new Error(d.detail||`Transcription request failed (${res.status})`);
+          const transcript=(d.transcript||"").trim();
+          if(!transcript)throw new Error("No speech was detected in the recording.");
+          onChange(prev=>(prev?prev+" ":"")+transcript);
+        }catch(e){
+          console.error("Whisper error",e);
+          setTranscriptionError(e.message||"Transcription failed. Try recording again.");
+        }
         finally{setTranscribing(false);}
       };
       mr.start();
@@ -9260,7 +9680,7 @@ function AnswerInputPanel({value, onChange, onSubmit, submitLabel="⚡ SUBMIT AN
             )}
             {transcribing&&(
               <span style={{fontSize:11,color:G.cyan,fontFamily:G.mono}}>
-                ⚙ Transcribing via Groq Whisper…
+                ⚙ Transcribing via Gemini (Groq Whisper fallback)…
               </span>
             )}
           </div>
@@ -9282,6 +9702,13 @@ function AnswerInputPanel({value, onChange, onSubmit, submitLabel="⚡ SUBMIT AN
                 rows={rows}
                 style={{width:"100%",padding:"10px 12px",fontSize:13,resize:"vertical"}}
               />
+            </div>
+          )}
+          {transcriptionError&&(
+            <div role="alert" style={{marginTop:10,padding:"8px 10px",borderRadius:6,
+              background:`${G.red}0c`,border:`1px solid ${G.red}35`,
+              color:G.red,fontSize:11,lineHeight:1.5}}>
+              {transcriptionError}
             </div>
           )}
         </div>
@@ -11334,8 +11761,8 @@ function Navbar({page,onNav,inSession,xp=0}){
       </div>
       <div style={{display:"flex",alignItems:"center",gap:16}}>
         <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
-          <NeonBadge text="LLaMA 3.3-70B" color={G.violet}/>
-          <NeonBadge text="Whisper ASR" color={G.cyan}/>
+          <NeonBadge text="Groq GPT-OSS-120B" color={G.violet}/>
+          <NeonBadge text="Gemini + Groq ASR" color={G.cyan}/>
           <NeonBadge text="RL v2" color={G.green}/>
         </div>
         <div style={{width:180}}>
@@ -11398,11 +11825,12 @@ export default function App(){
 
   const startSession=(s)=>{
     setSession(s);setSessionAnswers([]);setSessionIncidents([]);
-    setPage("baseline");   // Feature 5: go to baseline calibration before live interview
+    setPage("baseline");
     awardXP(50,{name:"Session Started",icon:"🚀",xp:50});
   };
   const enterLive=()=>setPage("live");
   const addAnswer=(a)=>setSessionAnswers(p=>[...p,a]);
+  const replaceLastAnswer=(a)=>setSessionAnswers(p=>p.length?[...p.slice(0,-1),a]:[a]);
 
   const finishSession=(answers,incidents=[])=>{
     setSessionIncidents(incidents||[]);
@@ -11446,7 +11874,8 @@ export default function App(){
             <PageBaseline session={session} onComplete={enterLive}/>
           )}
           {page==="live"&&session&&(
-            <PageLive session={session} onFinish={finishSession} addAnswer={addAnswer} awardXP={awardXP}/>
+            <PageLive session={session} onFinish={finishSession} addAnswer={addAnswer}
+              replaceLastAnswer={replaceLastAnswer} awardXP={awardXP}/>
           )}
           {page==="report"&&session&&(
             <PageReport session={session} answers={sessionAnswers} incidents={sessionIncidents} onNav={nav}/>
