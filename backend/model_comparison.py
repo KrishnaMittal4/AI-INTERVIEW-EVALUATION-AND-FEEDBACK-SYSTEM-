@@ -86,7 +86,7 @@ try:
 except ImportError:
     KAGGLE_OK = False
 
-_GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 # ---------------------------------------------------------------------------

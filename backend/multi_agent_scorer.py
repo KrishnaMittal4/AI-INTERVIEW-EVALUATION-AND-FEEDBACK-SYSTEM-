@@ -119,7 +119,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from groq import AsyncGroq
 
 # ── Existing Aura AI modules (keep intact — used for fallbacks) ──────────────
-from analyzer import InterviewAnalyzer, _full_evaluate_v3, _clamp
+from analyzer import (
+    InterviewAnalyzer,
+    _clamp,
+    _compute_disc,
+    _compute_ocean_v3,
+    _compute_sentiment,
+    _full_evaluate_v3,
+    _voice_nervousness_proxy_static,
+)
 from conflict_detector import detect_conflicts_dict
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -163,7 +171,7 @@ class RubricResult:
 class TraitResult:
     ocean: Dict[str, float] = field(default_factory=dict)   # 0–10 per trait
     disc_dominant: str = ""
-    disc_scores: Dict[str, float] = field(default_factory=dict)
+    disc_scores: Dict[str, int] = field(default_factory=dict)
     nervousness_proxy: float = 0.3    # 0–1 text-derived
     conscientiousness: float = 0.0
     hiring_signal: str = "Neutral"
@@ -198,7 +206,7 @@ class AgentTrace:
 #  GROQ CLIENT (shared singleton)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 _groq_client: Optional[Any] = None
 
 def _get_groq() -> Optional[Any]:
@@ -483,28 +491,17 @@ class TraitAgent:
         transcript: str,
         question_type: str,
     ) -> TraitResult:
-        from analyzer import (
-            _compute_ocean_v3, _compute_disc, _compute_sentiment,
-            _voice_nervousness_proxy_static,
-        )
-
         # --- NLP tier ---
         ocean, ocean_detail = _compute_ocean_v3(transcript.lower())
-        disc_scores, disc_dominant, conscientiousness = _compute_disc(transcript.lower())
+        disc_scores, disc_dominant, conscientiousness = _compute_disc(
+            transcript.lower(), ocean
+        )
         sentiment = _compute_sentiment(transcript.lower())
-
-        # Voice nervousness proxy (text-based — acoustic handled upstream)
-        try:
-            from analyzer import _voice_nervousness_proxy_static as _vnp
-            nerv_proxy = _vnp(transcript)
-        except ImportError:
-            # Inline fallback if the static function isn't exported yet
-            nerv_proxy = _compute_nervousness_proxy_inline(transcript)
+        nerv_proxy = _voice_nervousness_proxy_static(transcript)
 
         # Hiring signal from sentiment + ocean
-        openness = ocean.get("Openness", 5.0)
         conscient = ocean.get("Conscientiousness", 5.0)
-        pos_sent = sentiment.get("positive_score", 0.5)
+        pos_sent = (sentiment + 3.0) / 6.0
         hiring_signal = (
             "Strong" if pos_sent > 0.6 and conscient > 6.0 else
             "Positive" if pos_sent > 0.4 else
@@ -562,7 +559,9 @@ Return ONLY this JSON:
                 if llm_disc in ("D", "I", "S", "C"):
                     disc_dominant_map = {"D": "Dominance", "I": "Influence",
                                          "S": "Steadiness", "C": "Conscientiousness"}
-                    disc_dominant = disc_dominant_map.get(llm_disc, disc_dominant)
+                    mapped_disc = disc_dominant_map.get(llm_disc)
+                    if mapped_disc is not None:
+                        disc_dominant = mapped_disc
 
                 reasoning = llm_traits.get("trait_reasoning", "")
 
@@ -1143,7 +1142,7 @@ class AgentOrchestrator:
         transcript: str,
         question: str,
         question_type: str,
-        keywords: List[str] = None,
+        keywords: Optional[List[str]] = None,
         difficulty: str = "medium",
         duration_s: float = 60.0,
         ideal_answer: str = "",
@@ -1207,30 +1206,28 @@ class AgentOrchestrator:
         state = FSMState.RUBRIC
         t1 = time.time() * 1000
 
-        rubric_result: Optional[RubricResult] = None
-        trait_result: Optional[TraitResult] = None
-
-        try:
-            rubric_result, trait_result = await asyncio.gather(
-                self.rubric_agent.score(
-                    safe_transcript, question, question_type,
-                    keywords, difficulty, duration_s, ideal_answer,
-                ),
-                self.trait_agent.score(safe_transcript, question_type),
-                return_exceptions=True,
-            )
-        except Exception as e:
-            print(f"[Orchestrator] gather failed: {e}")
+        rubric_result, trait_result = await asyncio.gather(
+            self.rubric_agent.score(
+                safe_transcript, question, question_type,
+                keywords, difficulty, duration_s, ideal_answer,
+            ),
+            self.trait_agent.score(safe_transcript, question_type),
+            return_exceptions=True,
+        )
 
         t2 = time.time() * 1000
 
         # Handle individual agent failures
-        if isinstance(rubric_result, Exception):
+        if isinstance(rubric_result, BaseException):
+            if not isinstance(rubric_result, Exception):
+                raise rubric_result
             print(f"[RubricAgent] failed: {rubric_result} — falling back")
             degraded.append("RubricAgent")
             rubric_result = self._fallback_rubric(safe_transcript, question_type, keywords, difficulty, duration_s)
 
-        if isinstance(trait_result, Exception):
+        if isinstance(trait_result, BaseException):
+            if not isinstance(trait_result, Exception):
+                raise trait_result
             print(f"[TraitAgent] failed: {trait_result} — falling back")
             degraded.append("TraitAgent")
             trait_result = self._fallback_trait(safe_transcript, question_type)
@@ -1430,9 +1427,10 @@ class AgentOrchestrator:
     def _fallback_trait(self, transcript: str, q_type: str) -> TraitResult:
         """NLP-only trait when TraitAgent crashes."""
         try:
-            from analyzer import _compute_ocean_v3, _compute_disc
             ocean, _ = _compute_ocean_v3(transcript.lower())
-            disc_scores, disc_dominant, conscient = _compute_disc(transcript.lower())
+            disc_scores, disc_dominant, conscient = _compute_disc(
+                transcript.lower(), ocean
+            )
         except Exception:
             ocean = {k: 5.0 for k in ("Openness","Conscientiousness","Extraversion","Agreeableness","Neuroticism_inv")}
             disc_scores, disc_dominant, conscient = {}, "Steadiness", 5.0

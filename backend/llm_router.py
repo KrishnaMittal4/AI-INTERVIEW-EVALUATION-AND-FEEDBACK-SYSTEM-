@@ -17,7 +17,9 @@ import json
 import logging
 import re
 import asyncio
-from typing import Dict, List, Optional, Any
+import base64
+from typing import Dict, List, Optional, Any, cast
+from groq.types.chat import ChatCompletionMessageParam
 import httpx
 from dotenv import load_dotenv
 
@@ -29,7 +31,7 @@ logger = logging.getLogger("llm_router")
 # ── Configured API Keys & Models ─────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODELS = [
-    os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+    os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
 ]
@@ -45,6 +47,11 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODELS = [
     os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"),
     "liquid/lfm-2.5-2.6b:free",
+]
+
+GEMINI_AUDIO_MODELS = [
+    os.getenv("GEMINI_AUDIO_MODEL", "gemini-3.8-flash"),
+    *GEMINI_MODELS,
 ]
 
 
@@ -70,11 +77,14 @@ async def _call_groq(
         try:
             resp = await client.chat.completions.create(
                 model=m,
-                messages=messages,
+                messages=cast(List[ChatCompletionMessageParam], messages),
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content is None:
+                raise RuntimeError(f"Groq model '{m}' returned no message content")
+            return content.strip()
         except Exception as e:
             err_msg = str(e).lower()
             last_err = e
@@ -157,6 +167,140 @@ async def _call_gemini(
                 continue
 
     raise last_err or RuntimeError("All Gemini models failed")
+
+
+async def _transcribe_gemini(audio_bytes: bytes, mime_type: str) -> str:
+    key = os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set")
+
+    payload = {
+        "model": None,
+        "input": [
+            {
+                "type": "text",
+                "text": (
+                    "Transcribe the spoken words in this audio accurately. "
+                    "Return only the transcript, with no summary or commentary."
+                ),
+            },
+            {
+                "type": "audio",
+                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime_type": mime_type,
+            },
+        ],
+    }
+    last_error = None
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for model_name in dict.fromkeys(GEMINI_AUDIO_MODELS):
+            if not model_name:
+                continue
+            payload["model"] = model_name
+            try:
+                response = await client.post(
+                    "https://generativelanguage.googleapis.com/v1beta/interactions",
+                    headers={"x-goog-api-key": key},
+                    json=payload,
+                )
+                if response.status_code != 200:
+                    last_error = RuntimeError(
+                        f"Gemini transcription API {response.status_code}: "
+                        f"{response.text[:200]}"
+                    )
+                    logger.warning(
+                        "[llm_router] Gemini audio model '%s' failed with %s; trying the next model",
+                        model_name,
+                        response.status_code,
+                    )
+                    continue
+
+                data = response.json()
+                transcript = data.get("output_text", "").strip()
+                if not transcript:
+                    transcript = "\n".join(
+                        item.get("text", "").strip()
+                        for item in data.get("output", [])
+                        if item.get("type") == "text" and item.get("text")
+                    ).strip()
+                if transcript:
+                    return transcript
+                last_error = RuntimeError(
+                    "Gemini transcription returned no transcript text"
+                )
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = exc
+                logger.warning(
+                    "[llm_router] Gemini audio model '%s' request failed; trying the next model: %s",
+                    model_name,
+                    exc,
+                )
+
+    raise last_error or RuntimeError("All Gemini audio models failed")
+
+
+async def transcribe_audio(audio_path: str) -> str:
+    """Transcribe with Gemini first, then fall back to Groq Whisper."""
+    groq_key = os.getenv("GROQ_API_KEY") or GROQ_API_KEY
+    gemini_key = os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY
+    errors = []
+
+    if gemini_key:
+        import mimetypes
+
+        extension = os.path.splitext(audio_path)[1].lower()
+        mime_type = {
+            ".m4a": "audio/mp4",
+            ".mp4": "audio/mp4",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".wav": "audio/wav",
+            ".webm": "audio/webm",
+        }.get(extension) or mimetypes.guess_type(audio_path)[0] or "audio/webm"
+        try:
+            with open(audio_path, "rb") as audio_file:
+                return await _transcribe_gemini(audio_file.read(), mime_type)
+        except Exception as exc:
+            errors.append(exc)
+            logger.warning(
+                "[llm_router] Gemini transcription failed; trying Groq Whisper fallback: %s",
+                exc,
+            )
+
+    if groq_key:
+        from groq import AsyncGroq
+
+        client = AsyncGroq(api_key=groq_key)
+        for model_name in dict.fromkeys([
+            os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"),
+            "whisper-large-v3",
+        ]):
+            try:
+                with open(audio_path, "rb") as audio_file:
+                    result = await client.audio.transcriptions.create(
+                        file=(os.path.basename(audio_path), audio_file.read()),
+                        model=model_name,
+                        response_format="text",
+                    )
+                transcript = result.strip() if isinstance(result, str) else str(result).strip()
+                if transcript:
+                    return transcript
+                raise RuntimeError(f"Groq Whisper model '{model_name}' returned no transcript")
+            except Exception as exc:
+                errors.append(exc)
+                logger.warning(
+                    "[llm_router] Groq Whisper model '%s' failed; trying fallback: %s",
+                    model_name,
+                    exc,
+                )
+
+    if errors:
+        raise RuntimeError(
+            "All configured cloud transcription providers failed"
+        ) from errors[-1]
+    raise RuntimeError(
+        "No cloud transcription provider is configured. Set GROQ_API_KEY or GEMINI_API_KEY."
+    )
 
 
 # ── Provider 3: OpenRouter ───────────────────────────────────────────────────
@@ -354,14 +498,23 @@ class _SyncChatCompletions:
         return _RouterChatCompletionResponse(content)
 
 
+class _AsyncRouterChat:
+    def __init__(self) -> None:
+        self.completions = _AsyncChatCompletions()
+
+
+class _SyncRouterChat:
+    def __init__(self) -> None:
+        self.completions = _SyncChatCompletions()
+
+
 class AsyncRouterClient:
     """Drop-in async replacement for AsyncGroq or AsyncOpenAI client."""
     def __init__(self, api_key: Optional[str] = None, **kwargs):
-        self.chat = type("Chat", (), {"completions": _AsyncChatCompletions()})()
+        self.chat = _AsyncRouterChat()
 
 
 class SyncRouterClient:
     """Drop-in synchronous replacement for Groq or OpenAI client."""
     def __init__(self, api_key: Optional[str] = None, **kwargs):
-        self.chat = type("Chat", (), {"completions": _SyncChatCompletions()})()
-
+        self.chat = _SyncRouterChat()

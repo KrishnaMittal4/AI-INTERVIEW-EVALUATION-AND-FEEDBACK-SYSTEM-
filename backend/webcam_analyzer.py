@@ -49,7 +49,7 @@ import math
 import os
 import urllib.request
 import tempfile
-from typing import List, Optional
+from typing import Any, List, Optional
 
 try:
     import cv2
@@ -73,9 +73,9 @@ _FOREHEAD    = 10
 # backend once rather than on every frame.
 
 _MP_BACKEND = "none"   # "tasks" | "solutions" | "none"
-_mp_vision  = None
-_mp_python  = None
-_mp_solutions = None
+_mp_vision: Any = None
+_mp_python: Any = None
+_mp_solutions: Any = None
 
 if cv2 is not None:
     try:
@@ -87,8 +87,9 @@ if cv2 is not None:
             _MP_BACKEND = "tasks"
         except (ImportError, AttributeError):
             # Legacy Solutions API — available in MediaPipe < 0.10.0
-            if hasattr(_mp_module, "solutions"):
-                _mp_solutions = _mp_module.solutions
+            solutions = getattr(_mp_module, "solutions", None)
+            if solutions is not None:
+                _mp_solutions = solutions
                 _MP_BACKEND = "solutions"
     except ImportError:
         pass  # No mediapipe at all — will return neutral results
@@ -240,7 +241,9 @@ class WebcamNervousnessAnalyzer:
         # Supports both the new Tasks API (MP ≥ 0.10.0) and the legacy Solutions
         # API (MP < 0.10.0) so the same code works across all installed versions.
         if _MP_BACKEND == "none" or cv2 is None:
-            return self._neutral_result(0, reason="mediapipe_unavailable")
+            return self._neutral_result(
+                len(frames_b64), reason="mediapipe_unavailable"
+            )
 
         if _MP_BACKEND == "tasks":
             return self._analyze_frames_tasks(frames_b64)
@@ -316,7 +319,18 @@ class WebcamNervousnessAnalyzer:
                 head_poses.append(_head_pose_proxy(lm))
 
         if total_frames < self.MIN_FRAMES_REQUIRED:
-            return self._neutral_result(total_frames, reason="too_few_frames")
+            return self._neutral_result(
+                total_frames, reason="too_few_frames",
+                frames_with_face=detected_frames,
+            )
+
+        if detected_frames < self.MIN_FRAMES_REQUIRED:
+            reason = "no_face_detected" if detected_frames == 0 else "too_few_face_frames"
+            return self._neutral_result(
+                total_frames,
+                reason=reason,
+                frames_with_face=detected_frames,
+            )
 
         return self._compute_result(
             total_frames, detected_frames, blink_count, blink_frame_times,
@@ -338,9 +352,17 @@ class WebcamNervousnessAnalyzer:
         Both use normalised [0, 1] coordinates, so all EAR/MAR/asymmetry
         helpers (_ear, _mar, _asymmetry, _head_pose_proxy) work unchanged.
         """
+        if cv2 is None:
+            return self._neutral_result(
+                len(frames_b64), reason="opencv_unavailable"
+            )
+
+        cv2_module = cv2
         model_path = _get_task_model()
         if model_path is None:
-            return self._neutral_result(0, reason="task_model_download_failed")
+            return self._neutral_result(
+                len(frames_b64), reason="task_model_download_failed"
+            )
 
         import mediapipe as mp_local
         from mediapipe.tasks import python as mp_py
@@ -374,7 +396,7 @@ class WebcamNervousnessAnalyzer:
                 try:
                     img_bytes = base64.b64decode(b64)
                     arr   = np.frombuffer(img_bytes, np.uint8)
-                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    frame = cv2_module.imdecode(arr, cv2_module.IMREAD_COLOR)
                     if frame is None:
                         # Count as a total frame but reset blink state to avoid
                         # carrying a partial blink counter across a gap.
@@ -389,7 +411,7 @@ class WebcamNervousnessAnalyzer:
                     continue
 
                 h, w = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb = cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2RGB)
 
                 # Tasks API uses mp.Image wrapper
                 mp_image = mp_local.Image(
@@ -432,7 +454,18 @@ class WebcamNervousnessAnalyzer:
                 head_poses.append(_head_pose_proxy(lm))
 
         if total_frames < self.MIN_FRAMES_REQUIRED:
-            return self._neutral_result(total_frames, reason="too_few_frames")
+            return self._neutral_result(
+                total_frames, reason="too_few_frames",
+                frames_with_face=detected_frames,
+            )
+
+        if detected_frames < self.MIN_FRAMES_REQUIRED:
+            reason = "no_face_detected" if detected_frames == 0 else "too_few_face_frames"
+            return self._neutral_result(
+                total_frames,
+                reason=reason,
+                frames_with_face=detected_frames,
+            )
 
         return self._compute_result(
             total_frames, detected_frames, blink_count, blink_frame_times,
@@ -452,6 +485,14 @@ class WebcamNervousnessAnalyzer:
         head_poses: list,
     ) -> dict:
         """Shared metric aggregation used by both the Tasks and Solutions paths."""
+        if detected_frames < self.MIN_FRAMES_REQUIRED:
+            reason = "no_face_detected" if detected_frames == 0 else "too_few_face_frames"
+            return self._neutral_result(
+                total_frames,
+                reason=reason,
+                frames_with_face=detected_frames,
+            )
+
         duration_sec = total_frames / self._session_fps
         duration_min = max(duration_sec / 60.0, 0.01)
         blink_rate   = blink_count / duration_min
@@ -483,7 +524,10 @@ class WebcamNervousnessAnalyzer:
             pitch_values = [round(float(v), 5) for v in pitch_arr]
             head_instability = float(np.std(yaw_arr) + np.std(pitch_arr))
 
-        gaze_aversion_rate = 1.0 - (detected_frames / max(total_frames, 1))
+        face_detection_rate = detected_frames / max(total_frames, 1)
+        # Missing frames indicate that face tracking failed; they are not evidence
+        # that a visible candidate looked away from the camera.
+        gaze_aversion_rate = 0.0
 
         nervousness_score = self._score_nervousness(
             blink_rate           = blink_rate,
@@ -507,6 +551,13 @@ class WebcamNervousnessAnalyzer:
             "facial_asymmetry":       round(asymm_mean, 4),
             "frames_analyzed":        total_frames,
             "frames_with_face":       detected_frames,
+            "face_detected":          True,
+            "face_detection_rate":    round(face_detection_rate, 3),
+            "status":                 "partial" if face_detection_rate < 1.0 else "ok",
+            "warning": (
+                "Face was not visible in some captured frames. Keep your face centered and well lit."
+                if face_detection_rate < 1.0 else ""
+            ),
             "interpretation":         self._interpret(nervousness_score),
             "coaching_note":          self._coaching_note(
                 blink_rate, head_instability, gaze_aversion_rate
@@ -540,7 +591,7 @@ class WebcamNervousnessAnalyzer:
           EAR: PERCLOS             12%   Soukupová & Čech CVWW 2016
           EAR: variance            13%   Research Square 2025
           Head instability         20%   IEEE/PMC 2023 kineme traits
-          Gaze aversion            10%   PMC Multimodal Review 2025
+          Gaze aversion            10%   Reserved for an actual gaze signal
           Asymmetry + MAR           5%   Arxiv 2310.20083
 
         All sub-scores normalised to 0–1 before weighting.
@@ -595,8 +646,8 @@ class WebcamNervousnessAnalyzer:
             head_sc = min(1.0, 0.8 + (head_instability - 0.025) / 0.025 * 0.2)
 
         # ── 6. Gaze aversion (10%) ────────────────────────────────────────
-        # PMC Multimodal 2025: proportion of frames where face was undetected.
-        # 0 = always looking at camera; 1 = never detected.
+        # A missing face is a tracking failure, not gaze aversion. The caller
+        # reports face visibility separately and passes 0.0 for this component.
         gaze_sc = min(1.0, gaze_aversion * 1.5)   # 67% aversion → score 1.0
 
         # ── 7. Asymmetry + MAR (5%) ───────────────────────────────────────
@@ -734,7 +785,7 @@ class WebcamNervousnessAnalyzer:
         dict — same keys as result with nervousness_score adjusted and
                baseline_corrected=True added.
         """
-        if not baseline or not baseline.get("valid"):
+        if not result.get("face_detected") or not baseline or not baseline.get("valid"):
             result["baseline_corrected"] = False
             return result
 
@@ -800,10 +851,29 @@ class WebcamNervousnessAnalyzer:
         return corrected_result
 
     # ── Fallback ──────────────────────────────────────────────────────────────
-    def _neutral_result(self, frames: int, reason: str = "") -> dict:
+    def _neutral_result(
+        self,
+        frames: int,
+        reason: str = "",
+        frames_with_face: int = 0,
+    ) -> dict:
+        warning = {
+            "no_frames": "No webcam frames were captured; visual nervousness was not scored.",
+            "no_face_detected": "No face detected. Center your face in the camera and ensure good lighting.",
+            "too_few_frames": "Not enough usable webcam frames; visual nervousness was not scored.",
+            "too_few_face_frames": "Face was detected in too few frames; visual nervousness was not scored. Keep your face centered and visible.",
+            "mediapipe_unavailable": "Face detection is unavailable on the backend; visual nervousness was not scored.",
+            "task_model_download_failed": "Face detection could not start; visual nervousness was not scored.",
+        }.get(reason, "Face analysis is unavailable; visual nervousness was not scored.")
+        if reason in {
+            "no_frames", "no_face_detected", "too_few_frames",
+            "too_few_face_frames", "mediapipe_unavailable",
+            "task_model_download_failed",
+        }:
+            warning += " Overall nervousness still uses voice/text cues."
         return {
-            "nervousness_score":      20,
-            "nervousness_fraction":   0.20,
+            "nervousness_score":      None,
+            "nervousness_fraction":   None,
             "blink_rate_per_min":     15.0,
             "perclos":                0.05,
             "eye_stability":          0.85,
@@ -811,9 +881,13 @@ class WebcamNervousnessAnalyzer:
             "gaze_aversion_rate":     0.0,
             "facial_asymmetry":       0.01,
             "frames_analyzed":        frames,
-            "frames_with_face":       frames,
-            "interpretation":         "Insufficient data — neutral score assigned",
-            "coaching_note":          "Enable webcam for visual nervousness tracking.",
+            "frames_with_face":       frames_with_face,
+            "face_detected":          frames_with_face > 0,
+            "face_detection_rate":    round(frames_with_face / max(frames, 1), 3),
+            "status":                 "insufficient_data",
+            "warning":                warning,
+            "interpretation":         "Visual nervousness was not scored — insufficient face data.",
+            "coaching_note":          warning,
             # Raw lists — empty defaults for analyzer.py (will use calm defaults)
             "ear_values":             [],
             "yaw_values":             [],

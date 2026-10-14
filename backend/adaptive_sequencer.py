@@ -137,8 +137,7 @@ import json
 import logging
 import os
 import random
-from collections import deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1597,7 +1596,7 @@ class RLAdaptiveSequencer:
         return os.path.join(QTABLE_DIR, fname)
 
     @staticmethod
-    def _pad_qtable(q: np.ndarray) -> np.ndarray:
+    def _pad_qtable(q: np.ndarray) -> Optional[np.ndarray]:
         """
         Migrate a v1.0 Q-table (shape …×7) to v2.0 shape (…×8).
         The new follow_up column is initialised to 0.0 so it starts

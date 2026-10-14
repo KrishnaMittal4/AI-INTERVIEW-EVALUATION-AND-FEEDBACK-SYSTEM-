@@ -126,3 +126,40 @@ class TestAnalyzeOrchestration:
             question_type="behavioral",
         )
         assert result["scores"]["confidence"] < 70
+
+    @pytest.mark.asyncio
+    async def test_failing_ai_grade_caps_knowledge_score(self, analyzer, monkeypatch):
+        answer = (
+            "In my previous role, our team faced a serious production outage. "
+            "My task was to lead the incident response. I investigated the database, "
+            "built a caching solution, coordinated with the team, and reduced latency "
+            "by 40 percent. As a result, the service recovered within two hours and "
+            "customer complaints dropped. I learned to communicate clearly and measure "
+            "outcomes. "
+        ) * 4
+
+        async def high_relevance(*args, **kwargs):
+            return 1.0, "test"
+
+        async def failing_grade(*args, **kwargs):
+            return {
+                "technical_score": 0,
+                "relevance_score": 0,
+                "grade": "F",
+                "grade_reasoning": "The answer does not address the question.",
+            }
+
+        monkeypatch.setattr(analyzer, "_groq_relevance", high_relevance)
+        monkeypatch.setattr(analyzer, "_groq_hr_feedback", failing_grade)
+
+        result = await analyzer.analyze(
+            transcript=answer,
+            question="Tell me about a difficult situation.",
+            question_type="behavioral",
+            keywords=["team", "task", "investigated", "built", "reduced latency", "result", "customer"],
+            duration_s=160,
+        )
+
+        assert result["grade"] == "F"
+        assert result["scores"]["knowledge_1_5"] <= 1.5
+        assert result["scores"]["overall"] == result["scores"]["session_final"]

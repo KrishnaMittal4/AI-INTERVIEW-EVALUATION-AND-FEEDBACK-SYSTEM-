@@ -124,7 +124,7 @@ import math
 import tempfile
 import logging
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -397,7 +397,7 @@ def _load_audio(audio_path: str) -> Tuple[Optional[np.ndarray], int]:
     try:
         import librosa
         y, sr = librosa.load(audio_path, sr=_SR, mono=True)
-        return y, sr
+        return y, int(sr)
     except Exception as e:
         logger.warning(f"[AcousticNervousness] Audio load failed: {e}")
         return None, 0
@@ -1021,10 +1021,10 @@ class Wav2Vec2NervousnessModel:
 
     def __init__(self) -> None:
         self._available: Optional[bool] = None   # None = not yet attempted
-        self._processor  = None
-        self._encoder    = None
-        self._head       = None
-        self._torch      = None
+        self._processor: Any = None
+        self._encoder: Any = None
+        self._head: Any = None
+        self._torch: Any = None
         self._calibrated = False    # True only if fine-tuned checkpoint loaded
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -2077,9 +2077,13 @@ class _TieredAcousticAnalyser:
         # Prefer wav2vec2 (loaded once above, fast per window) over per-window
         # tier-2 extractor (slow per window due to pYIN re-computation).
         # CNN+BiLSTM tier-1 is used if it exposes per-segment scoring.
-        use_wav2vec2    = self._wav2vec2.available
-        use_tier1       = (self._unified is not None and self._unified.ready
-                           and hasattr(self._unified, "score_segment"))
+        use_wav2vec2 = self._wav2vec2.available
+        segment_scorer = (
+            getattr(self._unified, "score_segment", None)
+            if self._unified is not None and self._unified.ready
+            else None
+        )
+        use_tier1 = callable(segment_scorer)
         active_method   = ("CNN+BiLSTM_windowed"       if use_tier1
                            else "wav2vec2_calibrated"   if (use_wav2vec2 and self._wav2vec2.calibrated)
                            else "wav2vec2_uncalibrated" if use_wav2vec2
@@ -2095,9 +2099,9 @@ class _TieredAcousticAnalyser:
             centre_sec = (start + window_samples / 2) / sr
 
             try:
-                if use_tier1:
+                if callable(segment_scorer):
                     # Tier 1: CNN+BiLSTM segment scoring (if API available)
-                    seg_score = self._unified.score_segment(window, sr)
+                    seg_score = segment_scorer(window, sr)
                 elif use_wav2vec2:
                     # Tier 1.5: wav2vec2 per-window inference
                     seg_score = self._wav2vec2.score(window, sr)
@@ -2105,11 +2109,14 @@ class _TieredAcousticAnalyser:
                     # Tier 2: run full handcrafted extractor on this window
                     t2 = self._tier2._compute_all(window, sr)
                     seg_score = t2.acoustic_nervousness
+                if not isinstance(seg_score, (int, float)):
+                    raise TypeError("Acoustic model returned a non-numeric score.")
+                seg_score = float(seg_score)
             except Exception as exc:
                 logger.debug(f"[analyse_windowed] Window at {centre_sec:.1f}s failed: {exc}")
                 seg_score = 0.3   # neutral fallback for a failed window
 
-            scores.append(round(float(seg_score), 4))
+            scores.append(round(seg_score, 4))
             timestamps.append(round(centre_sec, 2))
             start += hop_samples
 

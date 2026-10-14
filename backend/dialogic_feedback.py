@@ -92,7 +92,7 @@ _STOP = {
 
 _MAX_TURNS       = 3          # Max candidate↔AI exchanges per question
 _SCORE_DELTA_CAP = 0.20       # Max total score change per turn (0–1 scale → ×5 for 0–5)
-_LLM_MODEL       = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+_LLM_MODEL       = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # ── Manipulation resistance constants (v2.0) ──────────────────────────────────
 

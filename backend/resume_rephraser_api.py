@@ -78,6 +78,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sas_scorer import sas_scorer as _sas_scorer
 
 # ── LLM Router (multi-provider cascade: Groq -> Gemini -> OpenRouter) ──────────
+PdfReader: Any = None
 try:
     from llm_router import SyncRouterClient
     _groq_client = SyncRouterClient()
@@ -86,9 +87,10 @@ except Exception:
     GROQ_OK = False
     _groq_client = None
 
-MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # ── Optional PDF reader ────────────────────────────────────────────────────────
+_docx: Any = None
 try:
     from pypdf import PdfReader
     PYPDF_OK = True
@@ -184,7 +186,9 @@ _PARSE_SYSTEM = (
 _REPHRASE_SYSTEM = (
     "You are an expert resume writer and career coach specialising in ATS-optimised, "
     "impact-driven language. Rephrase resume content to be stronger, more concise, and "
-    "achievement-focused. Use strong action verbs. Quantify where possible. Remove filler words. "
+    "achievement-focused. Use strong action verbs and remove filler words. Never invent, "
+    "estimate, or change facts, metrics, dates, titles, employers, tools, or achievements. "
+    "Only use quantitative details that already appear in the source. "
     "Always respond with valid JSON only. No markdown, no explanation."
 )
 
@@ -247,8 +251,10 @@ RESUME TEXT:
 
 def rephrase_resume(parsed: Dict, target_role: str = "") -> Dict:
     """
-    Rephrase all resume sections using stronger, ATS-optimised language via Groq.
-    Falls back to returning the original parsed dict if Groq is unavailable.
+    Rephrase resume sections without inventing or changing factual details.
+
+    Raises RuntimeError if the configured AI providers fail to return valid JSON,
+    rather than presenting the unchanged resume as successfully rephrased.
     """
     role_hint = f" The target role is: {target_role}." if target_role else ""
 
@@ -256,10 +262,11 @@ def rephrase_resume(parsed: Dict, target_role: str = "") -> Dict:
 
 Rules:
 - Use strong action verbs (Engineered, Architected, Optimised, Spearheaded, etc.)
-- Add quantification where reasonable (e.g. "Improved load time by ~40%")
+- Never add or estimate metrics, dates, tools, responsibilities, or achievements.
+- Preserve every factual detail and all existing numbers exactly; only reword claims.
 - Remove weak phrases like "responsible for", "helped with", "worked on"
 - Keep each bullet concise (max 20 words)
-- Rephrase skills into grouped categories with context
+- Keep the same skills and resume section structure.
 
 Input JSON:
 {json.dumps(parsed, indent=2)[:5000]}
@@ -270,7 +277,7 @@ For objects with "responsibilities" and "achievements", rephrase each item."""
 
     result = _call_groq_json(prompt, system=_REPHRASE_SYSTEM)
     if not isinstance(result, dict) or not result:
-        return parsed
+        raise RuntimeError("AI providers did not return a valid rephrased resume.")
     for k in parsed:
         result.setdefault(k, parsed[k])
     return result

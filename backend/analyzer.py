@@ -126,7 +126,7 @@ import os
 import re
 import json
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from groq import AsyncGroq
 from sas_scorer import sas_scorer, SASScorer
@@ -137,7 +137,7 @@ from cultural_adapter import (
     get_ocean_keywords_for_context,
 )
 
-_GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1012,7 +1012,7 @@ def _compute_ocean_v3(
 
 def compute_session_ocean(
     per_answer_oceans: List[Dict[str, float]],
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, Dict[str, Union[float, str]]]:
     """
     Multi-session OCEAN Aggregation v3.0
 
@@ -1052,7 +1052,7 @@ def compute_session_ocean(
         return {}
 
     traits = list(OCEAN_KEYWORDS.keys())
-    results: Dict[str, Dict[str, float]] = {}
+    results: Dict[str, Dict[str, Union[float, str]]] = {}
 
     for trait in traits:
         scores = [ans.get(trait, 3.0) for ans in per_answer_oceans]
@@ -1676,6 +1676,29 @@ def _compute_personality_nlp(ocean: Dict[str, float]) -> float:
     return round(_clamp(c * 0.40 + e * 0.35 + o * 0.15 + a * 0.10, 1.0, 5.0), 2)
 
 
+def _compute_disc(
+    text_lower: str,
+    ocean: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict[str, int], str, float]:
+    disc_traits = {
+        trait: sum(1 for keyword in keywords if keyword in text_lower)
+        for trait, keywords in DISC_KEYWORDS.items()
+    }
+    disc_dominant = (
+        max(disc_traits, key=lambda trait: disc_traits[trait])
+        if any(disc_traits.values())
+        else "None"
+    )
+    if ocean is None:
+        ocean, _ = _compute_ocean_v3(text_lower)
+    conscientiousness = round(
+        ocean.get("Conscientiousness", 3.0) * 0.6
+        + _clamp(disc_traits.get("Conscientiousness", 0) * 0.8 + 1.0, 1, 5) * 0.4,
+        2,
+    )
+    return disc_traits, disc_dominant, conscientiousness
+
+
 def _compute_sentiment(text_lower: str) -> float:
     pos = sum(1 for w in POSITIVE_SENTIMENT if w in text_lower)
     neg = sum(1 for w in NEGATIVE_SENTIMENT if w in text_lower)
@@ -1840,19 +1863,12 @@ def _full_evaluate_v3(
     )
     final_score = round(_clamp(raw_score + time_modifier, 1.0, 5.0), 2)
 
-    # ── DISC ──────────────────────────────────────────────────────────────────
-    disc_traits  = {tr: sum(1 for w in ws if w in al) for tr, ws in DISC_KEYWORDS.items()}
-    disc_dominant = max(disc_traits, key=disc_traits.get) if any(disc_traits.values()) else "None"
-
     # ── OCEAN v3.0 (context-gated, culture-adapted keywords) ─────────────────
     # _ocean_kw_bank is identical to OCEAN_KEYWORDS for LC candidates,
     # and the merged LC+HC bank for HC candidates (set at top of function).
     ocean, ocean_detail = _compute_ocean_v3(al, kw_hits, ocean_keywords=_ocean_kw_bank)
     personality_sc = _compute_personality_nlp(ocean)
-
-    conscientiousness = round(
-        ocean.get("Conscientiousness", 3.0) * 0.6 +
-        _clamp(disc_traits.get("Conscientiousness", 0) * 0.8 + 1.0, 1, 5) * 0.4, 2)
+    disc_traits, disc_dominant, conscientiousness = _compute_disc(al, ocean)
 
     # ── Sentiment + hiring ────────────────────────────────────────────────────
     sentiment      = _compute_sentiment(al)
@@ -1980,7 +1996,22 @@ def compute_facial_nervousness(
     yaw_angles: Optional[List[float]] = None,
     pitch_angles: Optional[List[float]] = None,
     ear_time_series: Optional[List[float]] = None,
+    face_detected: Optional[bool] = None,
 ) -> Dict:
+    if face_detected is False:
+        return {
+            "available": False,
+            "face_detected": False,
+            "facial_nervousness": 0.0,
+            "au_score": 0.0,
+            "blink_anxiety": 0.0,
+            "gaze_score": 0.0,
+            "pose_score": 0.0,
+            "ear_score": 0.0,
+            "blink_rate_per_min": 0.0,
+            "gaze_contact_ratio": 0.0,
+        }
+
     au_sc    = compute_au_score(au_intensities or {})
     blink_sc = compute_blink_anxiety(blink_rate_per_min, inter_blink_intervals)
     gaze_sc  = compute_gaze_score(gaze_contact_ratio, gaze_direction_std_deg)
@@ -1988,6 +2019,8 @@ def compute_facial_nervousness(
     ear_sc   = compute_ear_score(ear_time_series or [])
     facial   = _clamp(au_sc*0.30 + blink_sc*0.25 + gaze_sc*0.25 + pose_sc*0.10 + ear_sc*0.10, 0.0, 1.0)
     return {
+        "available": True,
+        "face_detected": face_detected,
         "facial_nervousness": round(facial, 3),
         "au_score": au_sc, "blink_anxiety": blink_sc,
         "gaze_score": gaze_sc, "pose_score": pose_sc, "ear_score": ear_sc,
@@ -1996,7 +2029,13 @@ def compute_facial_nervousness(
     }
 
 
-def fuse_nervousness(facial_nervousness: float, voice_nervousness: float) -> float:
+def fuse_nervousness(
+    facial_nervousness: float,
+    voice_nervousness: float,
+    facial_available: bool = True,
+) -> float:
+    if not facial_available:
+        return round(_clamp(voice_nervousness, 0.0, 1.0), 3)
     fused = (NERVOUSNESS_FUSION["facial"] * facial_nervousness +
              NERVOUSNESS_FUSION["voice"]  * voice_nervousness)
     return round(_clamp(fused, 0.0, 1.0), 3)
@@ -2023,6 +2062,68 @@ def aggregate_session_score(knowledge: float, emotion: float,
 #  INTERVIEW ANALYZER v3.0 — MAIN CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _voice_nervousness_proxy_static(text: str) -> float:
+    if not text or not text.strip():
+        return 0.30
+    text_lower = text.lower()
+    words = text_lower.split()
+    word_count = max(len(words), 1)
+    filler_count = sum(
+        len(re.findall(r"\b" + re.escape(filler) + r"\b", text_lower))
+        for filler in FILLER_WORDS
+    )
+    filler_score = _clamp(filler_count / word_count / 0.20, 0.0, 1.0)
+    hedges = [
+        "i think", "maybe", "i guess", "i hope", "kind of", "sort of",
+        "probably", "i feel like", "perhaps", "i suppose", "not sure",
+        "i'm not sure", "i believe", "might be", "could be", "not really",
+    ]
+    hedge_count = sum(text_lower.count(hedge) for hedge in hedges)
+    hedge_score = _clamp(hedge_count / word_count / 0.15, 0.0, 1.0)
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"[.!?]+", text.strip())
+        if len(sentence.strip()) > 3
+    ]
+    if len(sentences) >= 3:
+        sentence_lengths = [len(sentence.split()) for sentence in sentences]
+        mean_length = sum(sentence_lengths) / len(sentence_lengths)
+        variance = sum(
+            (length - mean_length) ** 2 for length in sentence_lengths
+        ) / len(sentence_lengths)
+        sentence_score = (
+            _clamp((variance ** 0.5) / mean_length / 1.5, 0.0, 1.0)
+            if mean_length > 0
+            else 0.5
+        )
+    elif len(sentences) == 2:
+        sentence_score = 0.4
+    else:
+        sentence_score = 0.6
+    type_token_ratio = len(set(words)) / word_count
+    vocabulary_score = (
+        _clamp((0.7 - type_token_ratio) / 0.4, 0.0, 1.0)
+        if type_token_ratio < 0.7
+        else 0.0
+    )
+    first_person_count = sum(
+        words.count(pronoun) for pronoun in ("i", "me", "my", "myself")
+    )
+    first_person_score = _clamp(first_person_count / word_count / 0.25, 0.0, 1.0)
+    return round(
+        _clamp(
+            0.30 * filler_score
+            + 0.20 * hedge_score
+            + 0.20 * sentence_score
+            + 0.15 * vocabulary_score
+            + 0.15 * first_person_score,
+            0.0,
+            0.95,
+        ),
+        3,
+    )
+
+
 class InterviewAnalyzer:
     """
     v3.0 — drops in over v2.0 with zero API surface changes.
@@ -2034,7 +2135,7 @@ class InterviewAnalyzer:
         from llm_router import AsyncRouterClient
         self.groq_api_key = os.getenv("GROQ_API_KEY", "")
         self.groq_client  = AsyncRouterClient()
-        self.whisper_ready = bool(self.groq_api_key)
+        self.whisper_ready = bool(self.groq_api_key or os.getenv("GEMINI_API_KEY"))
         self._whisper_model = None
         # Accumulate per-answer OCEAN scores for session aggregation
         self._session_oceans: List[Dict[str, float]] = []
@@ -2042,7 +2143,7 @@ class InterviewAnalyzer:
         self._session_answers: List[Dict] = []
 
     def check_groq_connection(self) -> bool:
-        return bool(self.groq_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
+        return bool(self.groq_api_key)
 
     def reset_session(self) -> None:
         """Call between interview sessions to reset OCEAN and coherence accumulators."""
@@ -2057,7 +2158,7 @@ class InterviewAnalyzer:
         """
         return compute_coherence_report(self._session_answers)
 
-    def get_session_ocean(self) -> Dict[str, Dict[str, float]]:
+    def get_session_ocean(self) -> Dict[str, Dict[str, Union[float, str]]]:
         """
         Returns the multi-session OCEAN aggregation for the current session.
         Call after all answers have been analyzed.
@@ -2070,23 +2171,37 @@ class InterviewAnalyzer:
     # ── Transcription (unchanged) ─────────────────────────────────────────────
 
     async def transcribe(self, audio_path: str) -> str:
-        if self.groq_client:
-            with open(audio_path, "rb") as f:
-                transcription = await self.groq_client.audio.transcriptions.create(
-                    file=(audio_path, f.read()),
-                    model="whisper-large-v3",
-                    response_format="text",
-                    language="en",
-                )
-            return transcription.strip()
+        from llm_router import transcribe_audio
+
+        cloud_configured = bool(
+            os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY")
+        )
+        cloud_error = None
+        if cloud_configured:
+            try:
+                return await transcribe_audio(audio_path)
+            except Exception as exc:
+                cloud_error = exc
         try:
             import whisper
             if not self._whisper_model:
-                self._whisper_model = whisper.load_model("base")
+                self._whisper_model = whisper.load_model(
+                    os.getenv("WHISPER_MODEL", "base")
+                )
             result = self._whisper_model.transcribe(audio_path)
-            return result["text"].strip()
+            transcribed_text = result["text"]
+            if not isinstance(transcribed_text, str):
+                raise RuntimeError("Local Whisper returned an invalid transcript.")
+            return transcribed_text.strip()
         except ImportError:
-            raise RuntimeError("No transcription provider. Set GROQ_API_KEY or: pip install openai-whisper")
+            if cloud_error:
+                raise RuntimeError(
+                    f"Cloud transcription failed and local Whisper is unavailable: {cloud_error}"
+                ) from cloud_error
+            raise RuntimeError(
+                "No transcription provider. Set GROQ_API_KEY or GEMINI_API_KEY, "
+                "or install openai-whisper."
+            )
 
     # ── Groq: semantic relevance (unchanged) ──────────────────────────────────
 
@@ -2415,37 +2530,7 @@ Judge technical answers strictly on accuracy."""
         return int((length_score + variety_score) / 2)
 
     def _voice_nervousness_proxy(self, text: str) -> float:
-        if not text or not text.strip():
-            return 0.30
-        tl    = text.lower()
-        words  = tl.split()
-        wc    = max(len(words), 1)
-        filler_count = sum(len(re.findall(r'\b' + re.escape(f) + r'\b', tl)) for f in FILLER_WORDS)
-        f1 = _clamp(filler_count / wc / 0.20, 0.0, 1.0)
-        _HEDGES = ["i think", "maybe", "i guess", "i hope", "kind of", "sort of",
-                   "probably", "i feel like", "perhaps", "i suppose", "not sure",
-                   "i'm not sure", "i believe", "might be", "could be", "not really"]
-        hedge_count = sum(tl.count(h) for h in _HEDGES)
-        f2 = _clamp(hedge_count / wc / 0.15, 0.0, 1.0)
-        sentences = [s.strip() for s in re.split(r'[.!?]+', text.strip()) if len(s.strip()) > 3]
-        if len(sentences) >= 3:
-            s_lens = [len(s.split()) for s in sentences]
-            mean_sl = sum(s_lens) / len(s_lens)
-            if mean_sl > 0:
-                variance = sum((x - mean_sl)**2 for x in s_lens) / len(s_lens)
-                f3 = _clamp((variance**0.5) / mean_sl / 1.5, 0.0, 1.0)
-            else:
-                f3 = 0.5
-        elif len(sentences) == 2:
-            f3 = 0.4
-        else:
-            f3 = 0.6
-        unique_words = set(words)
-        ttr = len(unique_words) / wc
-        f4 = _clamp((0.7 - ttr) / 0.4, 0.0, 1.0) if ttr < 0.7 else 0.0
-        first_person = sum(words.count(p) for p in ["i", "me", "my", "myself"])
-        f5 = _clamp(first_person / wc / 0.25, 0.0, 1.0)
-        return round(_clamp(0.30*f1 + 0.20*f2 + 0.20*f3 + 0.15*f4 + 0.15*f5, 0.0, 0.95), 3)
+        return _voice_nervousness_proxy_static(text)
 
     # ── Main analyze() — v3.0 ─────────────────────────────────────────────────
 
@@ -2457,18 +2542,19 @@ Judge technical answers strictly on accuracy."""
         audio_path: str       = "",
         duration_s: float     = 0.0,
         difficulty: str       = "medium",
-        question_dict: dict   = None,
-        webcam_data: dict     = None,
+        question_dict: Optional[dict] = None,
+        webcam_data: Optional[dict] = None,
         # ── Flat nervousness kwargs accepted from main.py /evaluate ──────────
-        keywords: list                  = None,
-        au_intensities: dict            = None,
+        keywords: Optional[list] = None,
+        au_intensities: Optional[dict] = None,
         blink_rate_per_min: float       = 15.0,
-        inter_blink_intervals: list     = None,
+        inter_blink_intervals: Optional[list] = None,
         gaze_contact_ratio: float       = 0.70,
         gaze_direction_std_deg: float   = 0.0,
-        yaw_angles: list                = None,
-        pitch_angles: list              = None,
-        ear_time_series: list           = None,
+        yaw_angles: Optional[list] = None,
+        pitch_angles: Optional[list] = None,
+        ear_time_series: Optional[list] = None,
+        face_detected: Optional[bool]    = None,
         cultural_context: str           = "auto",
     ) -> Dict:
         """
@@ -2494,6 +2580,7 @@ Judge technical answers strictly on accuracy."""
                 "yaw_angles":             yaw_angles or [],
                 "pitch_angles":           pitch_angles or [],
                 "ear_time_series":        ear_time_series or [],
+                "face_detected":          face_detected,
             }
 
         q_dict   = question_dict or {}
@@ -2552,11 +2639,23 @@ Judge technical answers strictly on accuracy."""
             except Exception:
                 acoustic_detail = {"method": "unavailable"}
 
+        facial_available = facial_result["available"]
+        fusion_weights = (
+            NERVOUSNESS_FUSION
+            if facial_available
+            else {"voice": 1.0, "facial": 0.0}
+        )
         fused_nervousness = fuse_nervousness(
-            facial_result["facial_nervousness"], voice_nervousness)
+            facial_result["facial_nervousness"],
+            voice_nervousness,
+            facial_available=facial_available,
+        )
 
         # ── Step 6: Final aggregation ─────────────────────────────────────────
         knowledge_sc = full_eval["final_score"]
+        if str(hr_result.get("grade", "")).strip().upper() == "F":
+            # Keep the numeric knowledge score consistent with an explicit failing grade.
+            knowledge_sc = min(knowledge_sc, 1.5)
         emotion_sc   = round(_clamp((1.0 - fused_nervousness) * 5, 1, 5), 2)
         voice_sc     = full_eval["fluency_score"]
         avg_depth    = full_eval["depth_score"]
@@ -2584,7 +2683,7 @@ Judge technical answers strictly on accuracy."""
             "success": True,
 
             "scores": {
-                "overall":       full_eval["final_score"],
+                "overall":       session_agg["final"],
                 "confidence":    adj_conf,
                 "clarity":       clarity,
                 "structure":     round(full_eval["star_score"] / 5 * 100),
@@ -2647,8 +2746,10 @@ Judge technical answers strictly on accuracy."""
                 "facial":            facial_result["facial_nervousness"],
                 "level": ("High" if fused_nervousness >= 0.65 else
                            "Moderate" if fused_nervousness >= 0.35 else "Low"),
-                "fusion_weights":    NERVOUSNESS_FUSION,
+                "fusion_weights":    fusion_weights,
                 "facial_detail": {
+                    "available":          facial_result["available"],
+                    "face_detected":      facial_result["face_detected"],
                     "au_score":           facial_result["au_score"],
                     "blink_anxiety":      facial_result["blink_anxiety"],
                     "gaze_score":         facial_result["gaze_score"],
