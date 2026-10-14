@@ -5373,6 +5373,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const[answer,setAnswer]=useState("");
   const[loading,setLoading]=useState(false);
   const[transcriptionError,setTranscriptionError]=useState("");
+  const[evaluationError,setEvaluationError]=useState("");
   const[evalResult,setEvalResult]=useState(null);
   const[retrying,setRetrying]=useState(false);
   const[practiceAttempts,setPracticeAttempts]=useState([]);
@@ -5519,7 +5520,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const submitWithText=async(answerText)=>{
     const text=(answerText||answer||"").trim();
     if(!text||submitting||evalResult)return;
-    setSubmitting(true);stopTimer();
+    setSubmitting(true);setEvaluationError("");stopTimer();
     try{
       const form=new FormData();
       form.append("session_id",session.sessionId);
@@ -5535,12 +5536,20 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
         form.append("webcam_frames",JSON.stringify(webcamFramesRef.current));
       }
       const res=await authFetch(`${API}/evaluate`,{method:"POST",body:form});
-      if(!res.ok)throw new Error("eval failed");
+      if(!res.ok)throw new Error(`Evaluation failed (HTTP ${res.status}). Please try again.`);
       const data=await res.json();
+      if(
+        typeof data?.scores?.overall!=="number"||
+        !Number.isFinite(data.scores.overall)||
+        typeof data?.scores?.knowledge_1_5!=="number"||
+        !Number.isFinite(data.scores.knowledge_1_5)
+      ){
+        throw new Error("The server response did not include valid evaluation scores. Please try again.");
+      }
       const na={
         question:question?.question||question,
         answer:text,
-        score:data.score||3,
+        score:data.score??data.scores.overall,
         ideal_answer:question?.ideal_answer||data.ideal_answer||"",
         keywords:question?.keywords||[],
         type:qType,
@@ -5562,30 +5571,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       else addAnswer(na);
       setRetrying(false);
     }catch(e){
-      // graceful fallback — shown when backend is unreachable
-      const mock={score:3.2,knowledge:3,star_coverage:0.5,
-        disc:{Dominance:5,Influence:5,Steadiness:5,Conscientiousness:5},
-        filler_count:2,wpm:130,hr_recommendation:"Maybe",
-        coaching_tip:"Connect the FastAPI backend (POST /evaluate) for AI scoring.",
-        nervousness:0.2,};
-      const na={
-        question:question?.question||question,
-        answer:text,
-        ideal_answer:question?.ideal_answer||"",
-        keywords:question?.keywords||[],
-        type:qType,
-        difficulty:qDiff,
-        ...mock,
-        ...(practiceAttempts.length>0?{practice_attempts:practiceAttempts}:{})
-      };
-      if(retrying){
-        setAnswers(a=>a.length>0?[...a.slice(0,-1),na]:[na]);
-        replaceLastAnswer(na);
-      }else{
-        setAnswers(a=>[...a,na]);
-        addAnswer(na);
-      }
-      setEvalResult(mock);setRetrying(false);
+      setEvaluationError(e.message||"Evaluation failed. Check your connection and try again.");
     }finally{setSubmitting(false);}
   };
 
@@ -5594,7 +5580,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const retryAnswer=()=>{
     if(!evalResult||!answer.trim())return;
     setPracticeAttempts(previous=>[...previous,{answer,result:evalResult}]);
-    setEvalResult(null);
+    setEvalResult(null);setEvaluationError("");
     setAnswer("");
     setRetrying(true);
     setTranscriptionError("");
@@ -5776,7 +5762,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
         ideal_answer:next.ideal_answer||"",
       });
       setQIndex(i=>i+1);
-      setAnswer("");setEvalResult(null);setRlHint(null);setTimer(0);
+      setAnswer("");setEvalResult(null);setEvaluationError("");setRlHint(null);setTimer(0);
       setRetrying(false);setPracticeAttempts([]);
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
@@ -5808,7 +5794,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       });
     }finally{
       setLoading(false);setQIndex(i=>i+1);
-      setAnswer("");setEvalResult(null);setRlHint(null);setTimer(0);
+      setAnswer("");setEvalResult(null);setEvaluationError("");setRlHint(null);setTimer(0);
       setRetrying(false);setPracticeAttempts([]);
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
@@ -6162,6 +6148,13 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
                 display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
                 <div style={{width:6,height:6,borderRadius:"50%",background:G.green,boxShadow:`0 0 8px ${G.green}`,animation:"pulse 1.2s infinite"}}/>
                 ANSWER EVALUATED — advance to next question ↓
+              </div>
+            )}
+            {evaluationError&&(
+              <div role="alert" style={{marginTop:10,padding:"8px 10px",borderRadius:6,
+                background:`${G.red}0c`,border:`1px solid ${G.red}35`,
+                color:G.red,fontSize:11,lineHeight:1.5}}>
+                {evaluationError}
               </div>
             )}
           </div>
