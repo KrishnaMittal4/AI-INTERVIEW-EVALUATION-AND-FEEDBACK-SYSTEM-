@@ -5,6 +5,9 @@ Run with: pytest tests/ -v
 
 import pytest
 import asyncio
+from types import SimpleNamespace
+
+import analyzer as analyzer_module
 from analyzer import InterviewAnalyzer, _compute_star_score_v3
 
 
@@ -111,6 +114,45 @@ class TestLocalNlp:
 
 # ─── Integration (async) ─────────────────────────────────
 class TestAnalyzeOrchestration:
+    @pytest.mark.asyncio
+    async def test_relevance_without_reference_answer_uses_question_only(
+        self, analyzer, monkeypatch
+    ):
+        prompts = []
+
+        class FakeCompletions:
+            async def create(self, **kwargs):
+                prompts.append(kwargs["messages"][0]["content"])
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content='{"relevance": 0.85}')
+                        )
+                    ]
+                )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+        monkeypatch.setattr(analyzer, "groq_client", fake_client)
+
+        def unexpected_sas_call(*args, **kwargs):
+            raise AssertionError("SAS must not compare an answer without a reference")
+
+        monkeypatch.setattr(analyzer_module.sas_scorer, "score", unexpected_sas_call)
+
+        score, source = await analyzer._groq_relevance(
+            "I handled the production incident by coordinating the response.",
+            "",
+            "Tell me about a difficult situation.",
+            "behavioural",
+        )
+
+        assert score == 0.85
+        assert source == "api_groq_question_only"
+        assert "Tell me about a difficult situation." in prompts[0]
+        assert "[Not provided; evaluate against the question.]" in prompts[0]
+
     @pytest.mark.asyncio
     async def test_analyze_returns_structure(self, analyzer):
         """Test full analyze() call (uses fallback without API key)."""

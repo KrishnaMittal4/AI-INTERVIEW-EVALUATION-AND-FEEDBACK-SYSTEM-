@@ -2207,13 +2207,19 @@ class InterviewAnalyzer:
 
     async def _groq_relevance(self, answer: str, ideal_answer: str,
                                question: str, q_type: str) -> Tuple[float, str]:
+        has_reference_answer = bool(ideal_answer and ideal_answer.strip())
+        reference_text = ideal_answer.strip() if has_reference_answer else question.strip()
+
         if not self.groq_client:
-            return self._tfidf_fallback(answer, ideal_answer), "tfidf_fallback"
+            source = "tfidf_fallback" if has_reference_answer else "tfidf_question_fallback"
+            return self._tfidf_fallback(answer, reference_text), source
 
         prompt = (
             "You are an expert interview answer evaluator.\n"
-            "Score how well the candidate answer covers the key concepts "
-            "in the reference. Return ONLY a JSON object with a single key "
+            "Score how well the candidate answer addresses the interview question "
+            "and covers the key concepts in the reference answer, when one is provided. "
+            "If no reference answer is provided, judge the answer directly against "
+            "the interview question. Return ONLY a JSON object with a single key "
             "'relevance' whose value is a float between 0.0 and 1.0.\n\n"
             "Scoring rubric:\n"
             "  1.0  — covers all key concepts\n"
@@ -2226,7 +2232,8 @@ class InterviewAnalyzer:
             "disfluencies. Judge what was communicated.\n\n"
             f"Question type: {q_type}\n"
             f"Question: {question[:500]}\n\n"
-            f"Reference answer:\n{ideal_answer[:600]}\n\n"
+            f"Reference answer:\n"
+            f"{reference_text[:600] if has_reference_answer else '[Not provided; evaluate against the question.]'}\n\n"
             f"Candidate answer:\n{answer[:800]}\n\n"
             'Return ONLY: {"relevance": 0.75}'
         )
@@ -2240,6 +2247,9 @@ class InterviewAnalyzer:
             raw = response.choices[0].message.content.strip()
             raw = raw.replace("```json", "").replace("```", "").strip()
             groq_score = round(_clamp(float(json.loads(raw)["relevance"]), 0.0, 1.0), 3)
+
+            if not has_reference_answer:
+                return groq_score, "api_groq_question_only"
 
             sas_score, sas_method = sas_scorer.score(answer, ideal_answer)
 
@@ -2262,10 +2272,11 @@ class InterviewAnalyzer:
             return fused_relevance, f"api_groq+sas_dynamic(wc={wc})"
         except Exception as e:
             print(f"[analyzer v3] Groq relevance failed: {e}")
-            # LLM down — pure SAS regardless of length (llm_available=False path
-            # in fuse_with_llm already returns pure sas_score, no weight applied)
-            sas_score, _ = sas_scorer.score(answer, ideal_answer)
-            return SASScorer.fuse_with_llm(sas_score, 0.0, llm_available=False), "sas_fallback"
+            # Without a reference answer, the question is the only meaningful
+            # comparison target; never compare the answer with itself.
+            sas_score, _ = sas_scorer.score(answer, reference_text)
+            source = "sas_fallback" if has_reference_answer else "sas_question_fallback"
+            return SASScorer.fuse_with_llm(sas_score, 0.0, llm_available=False), source
 
     def _tfidf_fallback(self, answer: str, reference: str) -> float:
         score, _ = sas_scorer.score(answer, reference)
@@ -2599,7 +2610,7 @@ Judge technical answers strictly on accuracy."""
 
         # ── Step 2: Groq relevance (async) ───────────────────────────────────
         rel_score, rel_source = await self._groq_relevance(
-            transcript, ideal or transcript[:300], question, question_type)
+            transcript, ideal, question, question_type)
 
         # ── Step 3: Full type-aware evaluation v3.0 ──────────────────────────
         full_eval = _full_evaluate_v3(
