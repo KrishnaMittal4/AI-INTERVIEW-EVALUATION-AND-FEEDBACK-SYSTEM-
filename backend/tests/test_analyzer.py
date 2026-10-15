@@ -8,7 +8,12 @@ import asyncio
 from types import SimpleNamespace
 
 import analyzer as analyzer_module
-from analyzer import InterviewAnalyzer, _compute_star_score_v3
+from analyzer import (
+    InterviewAnalyzer,
+    _compute_star_score_v3,
+    _full_evaluate_v3,
+    compute_facial_nervousness,
+)
 
 
 @pytest.fixture
@@ -76,6 +81,30 @@ class TestStructureScoring:
         score, components, _, _ = _compute_star_score_v3(text.lower())
         assert score == 0
         assert not any(components.values())
+
+    def test_star_quality_remains_structural_when_relevance_gate_is_zero(self):
+        answer = (
+            "When I worked at Acme, our team faced a major database outage. "
+            "My task was to restore service and protect customer data. "
+            "I investigated logs, rebuilt the cache, and coordinated the recovery. "
+            "As a result, service returned in two hours and downtime fell by 40 percent."
+        )
+        result = _full_evaluate_v3(
+            answer, "behavioral", [], relevance_score=0.0
+        )
+
+        assert all(result["star_scores"].values())
+        assert result["star_quality_score"] > 0
+        assert result["star_effective_score"] == 0
+        assert result["star_detail_v3"]["relevance_gate_factor"] == 0
+
+
+class TestSignalAvailability:
+    def test_missing_face_detection_does_not_count_as_facial_signal(self):
+        result = compute_facial_nervousness(face_detected=None)
+        assert result["available"] is False
+        assert result["face_detected"] is False
+        assert result["facial_nervousness"] == 0
 
 
 # ─── Clarity Scoring ─────────────────────────────────────
@@ -217,4 +246,14 @@ class TestAnalyzeOrchestration:
         )
         assert result["scores"]["star_quality_1_5"] == result["nlp"]["star_quality_1_5"]
         assert 0 <= result["scores"]["grammar_0_5"] <= 5
+        assert result["scores"]["relevance"] == 100
         assert result["scores"]["overall"] == result["scores"]["session_final"]
+        assert result["scores"]["answer_quality_1_5"] == result["scores"]["knowledge_1_5"]
+        expected_overall = round(
+            result["session_scores"]["knowledge"] * 0.70
+            + result["session_scores"]["emotion"] * 0.15
+            + result["session_scores"]["voice"] * 0.15,
+            2,
+        )
+        assert result["scores"]["overall"] == expected_overall
+        assert result["grade"] == analyzer_module._grade_for_score(expected_overall)

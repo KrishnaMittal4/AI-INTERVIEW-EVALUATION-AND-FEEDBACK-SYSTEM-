@@ -102,7 +102,7 @@ def test_gemini_transcription_sends_inline_audio(monkeypatch):
         status_code = 200
 
         def json(self):
-            return {"output_text": "spoken words"}
+            return {"candidates": [{"content": {"parts": [{"text": "spoken words"}]}}]}
 
     class FakeAsyncClient:
         def __init__(self, timeout):
@@ -125,11 +125,10 @@ def test_gemini_transcription_sends_inline_audio(monkeypatch):
     transcript = asyncio.run(_transcribe_gemini(b"audio", "audio/webm"))
 
     assert transcript == "spoken words"
-    assert request_data["url"].endswith("/v1beta/interactions")
+    assert request_data["url"].endswith("/models/test-audio-model:generateContent")
     assert request_data["headers"] == {"x-goog-api-key": "test-key"}
-    assert request_data["payload"]["model"] == "test-audio-model"
-    assert request_data["payload"]["input"][1] == {
-        "type": "audio",
-        "data": base64.b64encode(b"audio").decode("ascii"),
+    parts = request_data["payload"]["contents"][0]["parts"]
+    assert parts[1] == {"inline_data": {
         "mime_type": "audio/webm",
-    }
+        "data": base64.b64encode(b"audio").decode("ascii"),
+    }}

@@ -56,30 +56,39 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import hashlib
 import hmac
 import base64
 
+bcrypt: Any = None
+jwt: Any = None
+
 try:
-    import bcrypt
+    import bcrypt  # type: ignore[no-redef]
     BCRYPT_OK = True
 except ImportError:
     BCRYPT_OK = False
 
 try:
-    import jwt
+    import jwt  # type: ignore[no-redef]
     JWT_OK = True
 except ImportError:
     JWT_OK = False
-    jwt = None
 
 from fastapi import Depends, Header, HTTPException, status
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
-JWT_SECRET  = os.getenv("JWT_SECRET", "aura-ai-dev-secret-change-in-production-2025")
+JWT_SECRET  = os.getenv("JWT_SECRET", "")
+if not JWT_SECRET:
+    if os.getenv("ENVIRONMENT", "development").lower() in ("production", "prod"):
+        raise RuntimeError("JWT_SECRET must be set in production.")
+    import secrets as _secrets
+    JWT_SECRET = _secrets.token_urlsafe(48)   # per-process dev secret; tokens reset on restart
+    import logging as _lg
+    _lg.getLogger("auth").warning("JWT_SECRET not set - using a random dev secret.")
 JWT_ALG     = "HS256"
 JWT_EXPIRY  = 60 * 60 * 24      # 24 hours in seconds
 DB_PATH     = os.getenv("DB_PATH", "./aura_users.db")

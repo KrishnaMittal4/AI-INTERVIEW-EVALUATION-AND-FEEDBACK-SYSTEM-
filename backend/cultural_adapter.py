@@ -184,24 +184,25 @@ _COLLECTIVE_ACTION_VERBS = re.compile(
 
 # Original low-context weights (copied from analyzer.py for reference)
 _LC_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "technical":   {"star": 0.00, "word_cat": 0.10, "relevance": 0.40,
-                    "keyword": 0.25, "depth_flu": 0.20, "grammar": 0.05},
-    "behavioural": {"star": 0.35, "word_cat": 0.20, "relevance": 0.20,
-                    "keyword": 0.10, "depth_flu": 0.10, "grammar": 0.05},
-    "hr":          {"star": 0.20, "word_cat": 0.15, "relevance": 0.25,
-                    "keyword": 0.10, "depth_flu": 0.25, "grammar": 0.05},
+    # word_cat is retained as a key (weight 0.0) so downstream code keeps working;
+    # the quantifier/perceptual-word score no longer feeds the composite.
+    "technical":   {"star": 0.00, "word_cat": 0.00, "relevance": 0.45,
+                    "keyword": 0.25, "depth_flu": 0.25, "grammar": 0.05},
+    "behavioural": {"star": 0.40, "word_cat": 0.00, "relevance": 0.25,
+                    "keyword": 0.10, "depth_flu": 0.20, "grammar": 0.05},
+    "hr":          {"star": 0.25, "word_cat": 0.00, "relevance": 0.30,
+                    "keyword": 0.10, "depth_flu": 0.30, "grammar": 0.05},
 }
 
-# High-context adjusted weights
-# Key changes: STAR ↓, depth_flu ↑ (rewards reasoning quality over structure)
-# word_cat also ↑ slightly for behavioural (collective/relational vocabulary)
+# High-context adjusted weights: STAR down, depth/fluency up (rewards reasoning
+# quality over narrative structure).
 _HC_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "technical":   {"star": 0.00, "word_cat": 0.10, "relevance": 0.40,
-                    "keyword": 0.25, "depth_flu": 0.20, "grammar": 0.05},
-    "behavioural": {"star": 0.18, "word_cat": 0.22, "relevance": 0.20,
-                    "keyword": 0.10, "depth_flu": 0.25, "grammar": 0.05},
-    "hr":          {"star": 0.10, "word_cat": 0.17, "relevance": 0.25,
-                    "keyword": 0.10, "depth_flu": 0.33, "grammar": 0.05},
+    "technical":   {"star": 0.00, "word_cat": 0.00, "relevance": 0.45,
+                    "keyword": 0.25, "depth_flu": 0.25, "grammar": 0.05},
+    "behavioural": {"star": 0.18, "word_cat": 0.00, "relevance": 0.30,
+                    "keyword": 0.10, "depth_flu": 0.37, "grammar": 0.05},
+    "hr":          {"star": 0.10, "word_cat": 0.00, "relevance": 0.30,
+                    "keyword": 0.10, "depth_flu": 0.45, "grammar": 0.05},
 }
 
 

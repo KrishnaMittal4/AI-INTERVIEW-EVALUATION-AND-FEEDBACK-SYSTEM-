@@ -22,6 +22,8 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 from difflib import SequenceMatcher
 import json
 import os
@@ -47,6 +49,7 @@ from io import BytesIO
 from analyzer import (
     InterviewAnalyzer,
     _grade_for_score,
+    SCORE_WEIGHTS,
     _recommendation_for_score,
     compute_coherence_report,
 )
@@ -254,9 +257,125 @@ app.add_middleware(
 
 analyzer = InterviewAnalyzer()
 
+
+@app.middleware("http")
+async def _persist_sessions_mw(request, call_next):
+    """Write-behind: persist every session touched while serving this request."""
+    response = await call_next(request)
+    try:
+        SESSIONS.persist_touched()
+    except Exception as exc:                      # never break a response over persistence
+        logger.warning("session persist middleware: %s", exc)
+    return response
+
 # ── In-memory session store ───────────────────────────────────────────────────
 # Stores active session state: role, difficulty, question history, RL state
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+logger = logging.getLogger("aura.main")
+
+
+class SessionStore(dict):
+    """
+    In-memory session dict with SQLite write-behind so sessions survive a
+    restart / second worker. Non-serialisable values (RL sequencer, baseline
+    objects) are skipped on save; the sequencer is rebuilt on demand by
+    _get_sequencer(). Every session touched during a request is persisted by
+    the middleware below.
+    """
+
+    def __init__(self, db_path: str):
+        super().__init__()
+        self._db_path = db_path
+        self._touched: set = set()
+        try:
+            with sqlite3.connect(self._db_path) as c:
+                c.execute("CREATE TABLE IF NOT EXISTS sessions "
+                          "(sid TEXT PRIMARY KEY, data TEXT NOT NULL, updated REAL NOT NULL)")
+        except Exception as exc:
+            logger.warning("session DB unavailable (%s); sessions are memory-only", exc)
+            self._db_path = ""
+
+    # lazy load -------------------------------------------------------------
+    def _load(self, sid: str):
+        if not self._db_path or not isinstance(sid, str):
+            return None
+        try:
+            with sqlite3.connect(self._db_path) as c:
+                row = c.execute("SELECT data FROM sessions WHERE sid=?", (sid,)).fetchone()
+            if row:
+                data = json.loads(row[0])
+                super().__setitem__(sid, data)
+                return data
+        except Exception as exc:
+            logger.warning("session load failed: %s", exc)
+        return None
+
+    def __contains__(self, sid):
+        return super().__contains__(sid) or self._load(sid) is not None
+
+    def get(self, sid, default=None):
+        if super().__contains__(sid) or self._load(sid) is not None:
+            self._touched.add(sid)
+            return super().__getitem__(sid)
+        return default
+
+    def __getitem__(self, sid):
+        if sid in self:
+            self._touched.add(sid)
+            return super().__getitem__(sid)
+        raise KeyError(sid)
+
+    def __setitem__(self, sid, value):
+        self._touched.add(sid)
+        super().__setitem__(sid, value)
+
+    # persistence -----------------------------------------------------------
+    def persist_touched(self) -> None:
+        if not self._db_path or not self._touched:
+            self._touched.clear()
+            return
+        sids, self._touched = list(self._touched), set()
+        try:
+            with sqlite3.connect(self._db_path) as c:
+                for sid in sids:
+                    sess = dict.get(self, sid)
+                    if sess is None:
+                        continue
+                    safe = {}
+                    for k, v in sess.items():
+                        try:
+                            json.dumps(v)
+                            safe[k] = v
+                        except (TypeError, ValueError):
+                            pass          # skip non-serialisable (sequencer, baselines)
+                    c.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?)",
+                              (sid, json.dumps(safe), time.time()))
+        except Exception as exc:
+            logger.warning("session persist failed: %s", exc)
+
+    def purge_db(self, max_age_sec: float) -> None:
+        if not self._db_path:
+            return
+        try:
+            with sqlite3.connect(self._db_path) as c:
+                c.execute("DELETE FROM sessions WHERE updated < ?", (time.time() - max_age_sec,))
+        except Exception:
+            pass
+
+
+SESSIONS: SessionStore = SessionStore(os.getenv("SESSION_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")))
+_SESSION_TTL_SEC = int(os.getenv("SESSION_TTL_SEC", "21600"))   # 6 h
+_SESSION_MAX = int(os.getenv("SESSION_MAX", "500"))
+
+
+def _prune_sessions() -> None:
+    """Drop expired sessions and cap total count (oldest first) to bound memory."""
+    now = time.time()
+    SESSIONS.purge_db(_SESSION_TTL_SEC)
+    for sid in [k for k, v in SESSIONS.items() if now - v.get("_created", now) > _SESSION_TTL_SEC]:
+        SESSIONS.pop(sid, None)
+    if len(SESSIONS) > _SESSION_MAX:
+        for sid, _ in sorted(SESSIONS.items(), key=lambda kv: kv[1].get("_created", 0))[: len(SESSIONS) - _SESSION_MAX]:
+            SESSIONS.pop(sid, None)
 
 # ── DISC keyword map (from backend_engine.py) ─────────────────────────────────
 DISC_KEYWORDS: Dict[str, List[str]] = {
@@ -418,6 +537,7 @@ async def _generate_question(
     avoid: List[str],
     is_follow_up:  bool = False,
     prev_question: str  = "",
+    prev_answer: str    = "",
     company_pack:  str  = DEFAULT_COMPANY_PACK,
     topic_hint:    Optional[Dict] = None,
     resume_context: str = "",
@@ -434,6 +554,7 @@ async def _generate_question(
                         and one of its subtopics, ensuring full syllabus coverage
                         across a session rather than random topic drift.
     """
+    avoid = list(avoid or [])[-10:]   # cap prompt growth
     avoid_block = "\n".join(f"- {q}" for q in avoid) if avoid else "None"
 
     # ── Company pack style injection ──────────────────────────────────────────
@@ -473,7 +594,10 @@ async def _generate_question(
         prompt = (
             f"Generate ONE follow-up interview probe question for a {role} candidate.\n"
             f"The previous question was: {prev_question}\n"
-            f"The candidate gave a shallow or incomplete answer. Probe deeper into the same topic.\n"
+            f"The candidate's answer was: {json.dumps((prev_answer or '')[:800])}\n"
+            f"The candidate gave a shallow or incomplete answer. Probe deeper into the same topic, "
+            f"referring to something they actually said or skipped. "
+            f"Do NOT ask the candidate to write or produce any code.\n"
             f"{resume_instruction}{aptitude_instruction}\n"
             f"Do NOT repeat any question already used in this session:\n{avoid_block}\n"
             f"Return ONLY valid JSON: "
@@ -492,18 +616,27 @@ async def _generate_question(
             "}"
         )
 
-    response = await groq_client.chat.completions.create(
-        model=_GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user",   "content": prompt},
-        ],
-        temperature=0.7,
-        max_tokens=400,
-    )
-    raw = response.choices[0].message.content.strip()
     from llm_router import clean_json_response
-    parsed = json.loads(clean_json_response(raw))
+    parsed = None
+    for _attempt in range(2):                      # one retry on unparsable JSON
+        response = await groq_client.chat.completions.create(
+            model=_GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
+        try:
+            parsed = json.loads(clean_json_response(raw))
+            break
+        except json.JSONDecodeError as exc:
+            logger.warning("question JSON parse failed (attempt %d): %s", _attempt + 1, exc)
+    if parsed is None:
+        raise ValueError("Question generation returned unparsable JSON twice.")
     if isinstance(parsed, list):
         parsed = next(
             (
@@ -518,30 +651,45 @@ async def _generate_question(
         raise ValueError("Question generation must return a question object.")
     if not isinstance(parsed.get("question"), str) or not parsed["question"].strip():
         raise ValueError("Generated question object is missing a non-empty question.")
+    # Normalise fields so downstream scoring never sees bad types.
+    parsed["question"] = parsed["question"].strip()
+    parsed["type"] = q_type                      # never trust the model to echo these
+    parsed["difficulty"] = difficulty
+    kws = parsed.get("keywords")
+    if not isinstance(kws, list):
+        kws = [k.strip() for k in str(kws or "").split(",")]
+    parsed["keywords"] = [str(k).strip() for k in kws if str(k).strip()][:10]
+    if "ideal_answer" in parsed and not isinstance(parsed["ideal_answer"], str):
+        parsed["ideal_answer"] = ""
     return parsed
 
 
 async def _generate_report(groq_client, role: str, answers: List[Dict]) -> Dict:
-    """Generate final session HR report via Groq."""
+    """Generate final session HR report via the LLM router (with per-question context)."""
     avg = sum(a.get("score", 3) for a in answers) / max(len(answers), 1)
-    summary = "\n".join(
-        f"Q{i+1}: score={a.get('score',3):.1f}, STAR={a.get('star_coverage',0.5):.0%}, "
-        f"nervousness={a.get('nervousness',0.2):.0%}"
-        for i, a in enumerate(answers)
-    )
+    lines = []
+    for i, a in enumerate(answers):
+        lines.append(
+            f"Q{i+1} [{a.get('question_type', '?')}] {str(a.get('question', ''))[:140]}\n"
+            f"   score={float(a.get('score', 3)):.1f}/5, relevance={float(a.get('relevance_score', 0.5)):.0%}, "
+            f"STAR={float(a.get('star_coverage', 0.5)):.0%}, nervousness={float(a.get('nervousness', 0.2)):.0%}, "
+            f"fillers={a.get('filler_count', 0)}, answer excerpt: {str(a.get('answer', ''))[:200]!r}"
+        )
+    summary = "\n".join(lines)
+    rec = _recommendation_for_score(avg)
 
     prompt = f"""You are a senior HR evaluator. Review this mock interview session for a {role} candidate.
 
 Session summary:
 {summary}
-Average score: {avg:.2f}/5
+Average score: {avg:.2f}/5 (score-band recommendation: {rec})
 
+Base your feedback on the specific questions above; do not give generic advice.
 Return ONLY valid JSON:
 {{
-  "hr_recommendation": "<Strong Yes | Yes | Maybe | No>",
-  "hr_reasoning": "<2-3 sentence hiring recommendation>",
-  "top_strength": "<candidate's biggest strength>",
-  "top_weakness": "<biggest area to improve>",
+  "hr_reasoning": "<2-3 sentence hiring recommendation consistent with the {rec} band>",
+  "top_strength": "<candidate's biggest strength, citing a question>",
+  "top_weakness": "<biggest area to improve, citing a question>",
   "overall_coaching": "<one actionable improvement tip for the candidate>"
 }}"""
 
@@ -549,11 +697,14 @@ Return ONLY valid JSON:
         model=_GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        max_tokens=500,
+        max_tokens=700,
     )
     raw = response.choices[0].message.content.strip()
     from llm_router import clean_json_response
-    return json.loads(clean_json_response(raw))
+    data = json.loads(clean_json_response(raw))
+    if not isinstance(data, dict):
+        raise ValueError("Report must be a JSON object.")
+    return data
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -573,6 +724,13 @@ async def root():
             "/voice/status", "/voice/train",
         ],
     }
+
+
+@app.get("/health/llm")
+async def health_llm():
+    """Live check: one tiny real call per configured LLM provider."""
+    from llm_router import probe_providers
+    return await probe_providers()
 
 
 @app.get("/health")
@@ -852,7 +1010,7 @@ async def voice_train(
 
     def _cb(msg: str) -> None:
         progress_log.append(msg)
-        print(msg)
+        logger.info(msg)
 
     try:
         metrics = await asyncio.to_thread(
@@ -1084,14 +1242,10 @@ async def study_notes(req: StudyNotesRequest):
     Request body : { role, company_pack, depth, topics[] }
     Response     : text/event-stream  →  data: <chunk>\n\n  ...  data: [DONE]\n\n
     """
-    groq_key = os.environ.get("GROQ_API_KEY", "")
-    if not groq_key:
+    if not any(os.environ.get(k) for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY")):
         raise HTTPException(
             status_code=503,
-            detail=(
-                "GROQ_API_KEY is not set. "
-                "Add it to your .env file and restart the server."
-            ),
+            detail="No LLM provider key is set (GROQ_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY).",
         )
 
     topics = req.topics or list(get_syllabus(req.role).keys())
@@ -1108,10 +1262,6 @@ async def study_notes(req: StudyNotesRequest):
         Retries once if the required ## heading is missing from the response.
         """
         prompt = _build_single_topic_prompt(req.role, req.company_pack, req.depth, topic)
-        headers = {
-            "Authorization": f"Bearer {groq_key}",
-            "Content-Type":  "application/json",
-        }
         payload = {
             "model":       _GROQ_MODEL,
             "max_tokens":  1200,
@@ -1123,17 +1273,14 @@ async def study_notes(req: StudyNotesRequest):
             ],
         }
         text = ""
+        from llm_router import route_llm
         for attempt in range(2):
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Groq {resp.status_code}: {resp.text[:200]}")
-                data = resp.json()
-                text = data["choices"][0]["message"]["content"].strip()
+            if True:
+                # Routed through Groq -> Gemini -> OpenRouter so notes survive a single-provider outage.
+                text = (await asyncio.wait_for(
+                    route_llm(payload["messages"], temperature=0.4, max_tokens=2000),
+                    timeout=90,
+                )).strip()
                 # Validate: must contain a ## heading
                 if "## " in text:
                     return text
@@ -1371,14 +1518,14 @@ async def session_start(
     first_question = None
     if analyzer.groq_client:
         try:
-            first_question = await _generate_question(
+            first_question = await asyncio.wait_for(_generate_question(
                 analyzer.groq_client, role, first_diff, first_type, avoid=[],
                 company_pack=company_pack,
                 topic_hint=topic_hint,
                 resume_context=json.dumps(parsed_resume_data) if parsed_resume_data else resume_text,
-            )
+            ), timeout=25)
         except Exception as e:
-            print(f"[session/start] Groq question gen failed: {e}")
+            logger.warning(f"[session/start] Groq question gen failed: {e}")
 
     if not first_question:
         fallback_text = _FALLBACK_Q.get(first_type, _FALLBACK_Q["Technical"])
@@ -1392,7 +1539,9 @@ async def session_start(
         }
 
     # ── Initialise session state ───────────────────────────────────────────────
+    _prune_sessions()
     SESSIONS[session_id] = {
+        "_created":         time.time(),
         "role":             role,
         "difficulty":       difficulty,
         "num_questions":    num_questions,
@@ -1574,7 +1723,7 @@ async def transcribe_audio(
                 acoustic_analyser.analyse, tmp_path
             )
         except Exception as _ve:
-            print(f"[transcribe] Voice model failed: {_ve}")
+            logger.warning(f"[transcribe] Voice model failed: {_ve}")
 
         # Cache in session so /evaluate can read it
         if session_id and session_id in SESSIONS:
@@ -1684,7 +1833,7 @@ async def evaluate_answer(
                 "_reason": "analysis_error",
                 "warning": "Webcam frames could not be analyzed; visual nervousness was not scored.",
             }
-            print(f"[evaluate] Webcam analysis failed: {e}")
+            logger.warning(f"[evaluate] Webcam analysis failed: {e}")
 
     face_detected = bool(
         webcam_result.get("face_detected")
@@ -1806,23 +1955,18 @@ async def evaluate_answer(
 
     # Bug fix: if session_scores["final"] is missing, recompute from components rather than
     # silently collapsing to scores["overall"] (which equals knowledge — making Overall == Knowledge).
-    if session_scores.get("final") is not None:
-        overall_score = float(max(0.5, min(5.0, round(
-            knowledge_score * 0.70 +
-            max(1.0, min(5.0, (1.0 - fused_nervousness) * 5.0)) * 0.15 +
-            float(scores.get("fluency", 3.0)) * 0.15,
-            2,
-        ))))
-    else:
-        _emotion_fallback = round(max(1.0, min(5.0, (1.0 - fused_nervousness) * 5.0)), 2)
-        _voice_fallback   = scores.get("fluency", 3.0)
-        overall_score = float(max(0.5, min(5.0, round(
-            knowledge_score * 0.70 +
-            _emotion_fallback * 0.15 +
-            _voice_fallback   * 0.15,
-            2,
-        ))))
+    emotion_score = round(max(1.0, min(5.0, (1.0 - fused_nervousness) * 5.0)), 2)
+    voice_score   = float(scores.get("fluency") or 3.0)
+    overall_score = float(max(0.5, min(5.0, round(
+        knowledge_score * SCORE_WEIGHTS["knowledge"]
+        + emotion_score * SCORE_WEIGHTS["emotion"]
+        + voice_score   * SCORE_WEIGHTS["voice"],
+        2,
+    ))))
     session_scores["final"] = overall_score
+    session_scores["knowledge"] = knowledge_score
+    session_scores["emotion"] = emotion_score
+    session_scores["voice"] = voice_score
     grade = _grade_for_score(overall_score)
     hr_recommendation = _recommendation_for_score(overall_score)
     grade_reasoning = (
@@ -1901,6 +2045,7 @@ async def evaluate_answer(
         "answer":             answer,
         "score":              overall_score,
         "knowledge":          round(knowledge_score, 2),
+        "answer_quality":     round(knowledge_score, 2),
         "star_coverage":      star_cov,
         "disc":               disc,
         "filler_count":       filler_cnt,
@@ -1917,9 +2062,11 @@ async def evaluate_answer(
         "depth_score":        scores.get("depth", 0.0),
         # ── Skill Gap fields ──────────────────────────────────────────────────
         "fluency_score":      scores.get("fluency", 0.0),
-        "keyword_score":      round(len(nlp_detail.get("keyword_hits", [])) /
-                              max(len(keywords), 1), 3) if nlp_detail.get("keyword_hits")
-                              else scores.get("relevance", 50) / 100.0,
+        # None (not a made-up value) when the question had no keywords
+        "keyword_score":      (round(len(nlp_detail.get("keyword_hits", [])) / len(keywords), 3)
+                               if keywords else None),
+        "clarity_score":      (round(float(scores["clarity"]) / 100.0, 3)
+                               if scores.get("clarity") is not None else None),
         "question_type":      q_type,
         "relevance_score":    scores.get("relevance", 50) / 100.0,
         "grammar_score":      float(scores.get("grammar_0_5", 0.0)) / 5.0,
@@ -1937,12 +2084,14 @@ async def evaluate_answer(
         "scores": {
             "overall":       overall_score,
             "knowledge_1_5": knowledge_score,
+            "answer_quality_1_5": knowledge_score,
             "session_final": session_scores.get("final"),
             "confidence":    scores.get("confidence"),
             "clarity":       scores.get("clarity"),
             "clarity_is_estimate": True,
             "structure":     scores.get("structure"),
             "star_quality_1_5": scores.get("star_quality_1_5"),
+            "star_effective_1_5": scores.get("star_effective_1_5"),
             "grammar_0_5":   scores.get("grammar_0_5"),
             "technical":     scores.get("technical"),
             "relevance":     scores.get("relevance"),
@@ -1999,6 +2148,7 @@ async def evaluate_answer(
         "nlp_detail": {
             "star_scores":      nlp_detail.get("star_scores", {}),
             "star_quality_1_5": nlp_detail.get("star_quality_1_5"),
+            "star_effective_1_5": nlp_detail.get("star_effective_1_5"),
             "grammar_score_0_5": nlp_detail.get("grammar_score_0_5"),
             "grammar_detail":   nlp_detail.get("grammar_detail_v3", {}),
             "disc_dominant":    nlp_detail.get("disc_dominant"),
@@ -2021,6 +2171,9 @@ async def evaluate_answer(
         "annotated_transcript": analysis.get("annotated_transcript", answer),
         "key_strengths":        analysis.get("ai_evaluation", {}).get("key_strengths", []),
         "improvement_areas":    analysis.get("ai_evaluation", {}).get("improvement_areas", []),
+        "llm_judge":            analysis.get("llm_judge", {}),
+        "judge_errors":         analysis.get("ai_evaluation", {}).get("judge_errors", []),
+        "judge_missing":        analysis.get("ai_evaluation", {}).get("judge_missing", []),
         "hr_recommendation":    hr_recommendation,
         "hr_reasoning":          f"{hr_recommendation} is based on the overall score of {overall_score}/5.",
         "technical_evaluation": analysis.get("ai_evaluation", {}).get("technical_evaluation", ""),
@@ -2273,15 +2426,16 @@ async def extract_jd(req: JDExtractRequest):
             raw = resp.choices[0].message.content.strip()
             from llm_router import clean_json_response
             data = json.loads(clean_json_response(raw))
-            return {"success": True, "data": data}
-        except Exception:
-            pass
+            return {"success": True, "data": data, "source": "llm"}
+        except Exception as exc:
+            logger.warning("/jd LLM extraction failed: %s: %s", type(exc).__name__, exc)
 
     # Graceful fallback heuristic
     title_match = re.search(r'(Software Engineer|Frontend Developer|Backend Developer|Full Stack Engineer|DevOps Engineer|Data Scientist|Machine Learning Engineer|Cloud Architect|Product Manager|Data Analyst|Security Engineer)', text, re.I)
     role_title = title_match.group(0).title() if title_match else "Custom Specialized Role"
     return {
         "success": True,
+        "source": "heuristic_fallback",
         "data": {
             "role": role_title,
             "category": "Software & Systems",
@@ -2340,11 +2494,15 @@ async def generate_followup(req: FollowUpRequest):
             )
             raw = resp.choices[0].message.content.strip()
             from llm_router import clean_json_response
-            return json.loads(clean_json_response(raw))
-        except Exception:
-            pass
+            out = json.loads(clean_json_response(raw))
+            if isinstance(out, dict) and out.get("follow_up"):
+                out["source"] = "llm"
+                return out
+        except Exception as exc:
+            logger.warning("/followup LLM failed: %s: %s", type(exc).__name__, exc)
 
     return {
+        "source": "fallback",
         "follow_up": f"Walk me through the failure modes of that approach: what trade-offs did you accept, and how would you monitor it under peak production traffic?",
         "probe_reason": "Testing architectural resilience and trade-off awareness.",
         "ideal_follow_up_answer": "A strong answer acknowledges trade-offs (e.g. latency vs consistency) and details metrics, circuit breakers, and automated failover."
@@ -2424,6 +2582,7 @@ async def next_question(body: NextQuestionRequest):
                     avoid        = generation_avoid,
                     is_follow_up = is_follow_up,
                     prev_question= prev_question,
+                    prev_answer  = (session.get("answers") or [{}])[-1].get("answer", ""),
                     company_pack = company_pack,
                     topic_hint   = topic_hint,
                     resume_context = (
@@ -2434,13 +2593,13 @@ async def next_question(body: NextQuestionRequest):
                 )
                 candidate_text = candidate.get("question", "")
                 if _is_duplicate_question(candidate_text, generation_avoid):
-                    print(f"[next_question] Rejected repeated question (attempt {attempt + 1}).")
+                    logger.info(f"[next_question] Rejected repeated question (attempt {attempt + 1}).")
                     generation_avoid.append(candidate_text)
                     continue
                 question = candidate
                 break
             except Exception as e:
-                print(f"[next_question] Groq generation attempt {attempt + 1} failed: {e}")
+                logger.warning(f"[next_question] Groq generation attempt {attempt + 1} failed: {e}")
 
     if not question:
         # Fallback — Technical = conceptual/architectural only (no code editor)
@@ -2533,7 +2692,7 @@ async def generate_report(body: ReportRequest):
         try:
             seq.save()
         except Exception as e:
-            print(f"[report] Q-table save failed: {e}")
+            logger.warning(f"[report] Q-table save failed: {e}")
 
         rl_report = {
             "total_steps":      seq.total_steps,
@@ -2570,21 +2729,29 @@ async def generate_report(body: ReportRequest):
                 analyze_gap, resume_parsed, answers, role
             )
         except Exception as e:
-            print(f"[report] resume gap analysis failed: {e}")
+            logger.warning(f"[report] resume gap analysis failed: {e}")
 
     # ── Groq HR recommendation ─────────────────────────────────────────────────
     hr_data: Dict[str, Any] = {}
+    llm_report_ok = False
     if analyzer.groq_client:
         try:
-            hr_data = await _generate_report(analyzer.groq_client, role, answers)
+            hr_data = await asyncio.wait_for(
+                _generate_report(analyzer.groq_client, role, answers), timeout=45)
+            llm_report_ok = bool(hr_data.get("hr_reasoning"))
         except Exception as e:
-            print(f"[report] Groq HR report failed: {e}")
+            logger.warning(f"[report] LLM HR report failed: {type(e).__name__}: {e}")
+            hr_data = {}
 
+    # Recommendation always comes from the score bands (deterministic);
+    # the LLM supplies the narrative reasoning when available.
     rec = _recommendation_for_score(avg_score)
     hr_data["hr_recommendation"] = rec
-    hr_data["hr_reasoning"] = (
-        f"{rec} is based on the session average score of {avg_score}/5."
-    )
+    if not llm_report_ok:
+        hr_data["hr_reasoning"] = (
+            f"{rec} is based on the session average score of {avg_score}/5."
+        )
+    hr_data["report_source"] = "llm" if llm_report_ok else "score_fallback"
     hr_data.setdefault("top_strength", "Shows effort and engagement throughout the session.")
     hr_data.setdefault("top_weakness", "Needs to improve answer structure and reduce filler words.")
     hr_data.setdefault(
@@ -2646,16 +2813,25 @@ async def skill_gap(body: SkillGapRequest):
 
     # ── Build per-answer skill vectors ────────────────────────────────────────
     # Each dimension is normalised to 0–1.
-    def _skill_vec(a: Dict) -> Dict[str, float]:
+    def _opt(val):
+        """float or None - missing values are excluded, never replaced by a neutral guess."""
+        try:
+            return float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _skill_vec(a: Dict) -> Dict[str, Optional[float]]:
+        k, nerv, dep = _opt(a.get("knowledge")), _opt(a.get("nervousness")), _opt(a.get("depth_score"))
+        flu, gra = _opt(a.get("fluency_score")), _opt(a.get("grammar_score"))
         return {
-            "Knowledge":   _safe(a.get("knowledge"), 3.0) / 5.0,
-            "STAR":        _safe(a.get("star_coverage"), 0.5),
-            "Composure":   1.0 - _safe(a.get("nervousness"), 0.3),
-            "Depth":       _safe(a.get("depth_score"), 0.0) / 5.0,
-            "Fluency":     _safe(a.get("fluency_score"), 0.0) / 5.0,
-            "Keywords":    _safe(a.get("keyword_score"), 0.4),
-            "Clarity":     _safe(a.get("score"), 3.0) / 5.0,
-            "Grammar":     _safe(a.get("grammar_score"), 0.5),
+            "Knowledge": None if k is None else k / 5.0,
+            "STAR":      _opt(a.get("star_coverage")),
+            "Composure": None if nerv is None else 1.0 - nerv,
+            "Depth":     None if dep is None else dep / 5.0,
+            "Fluency":   None if flu is None else flu / 5.0,
+            "Keywords":  _opt(a.get("keyword_score")),
+            "Clarity":   _opt(a.get("clarity_score")),     # independent of the overall score
+            "Grammar":   gra,
         }
 
     vecs = [_skill_vec(a) for a in answers]
@@ -2667,15 +2843,18 @@ async def skill_gap(body: SkillGapRequest):
     first_half  = vecs[:mid]
     second_half = vecs[mid:]
 
-    def _avg(half: List[Dict], skill: str) -> float:
-        return sum(v[skill] for v in half) / len(half)
+    def _avg(half: List[Dict], skill: str) -> Optional[float]:
+        vals = [v[skill] for v in half if v.get(skill) is not None]
+        return sum(vals) / len(vals) if vals else None
 
-    # ── Compute deltas ────────────────────────────────────────────────────────
+    # ── Compute deltas (skills without data in both halves are skipped) ───────
     deltas = {}
-    for s in skills:
-        early = _avg(first_half, s)
-        late  = _avg(second_half, s)
-        deltas[s] = {
+    for s_name in skills:
+        early = _avg(first_half, s_name)
+        late  = _avg(second_half, s_name)
+        if early is None or late is None:
+            continue
+        deltas[s_name] = {
             "early":  round(early * 100, 1),
             "late":   round(late * 100, 1),
             "delta":  round((late - early) * 100, 1),
@@ -2685,10 +2864,11 @@ async def skill_gap(body: SkillGapRequest):
         }
 
     # ── Session averages ──────────────────────────────────────────────────────
-    session_avgs = {
-        s: round(sum(v[s] for v in vecs) / n * 100, 1)
-        for s in skills
-    }
+    session_avgs = {}
+    for s_name in skills:
+        vals = [v[s_name] for v in vecs if v.get(s_name) is not None]
+        if vals:
+            session_avgs[s_name] = round(sum(vals) / len(vals) * 100, 1)
 
     # ── Priority focus: biggest drops first ───────────────────────────────────
     sorted_by_delta = sorted(deltas.items(), key=lambda x: x[1]["delta"])

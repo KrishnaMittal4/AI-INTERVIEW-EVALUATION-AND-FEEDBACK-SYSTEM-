@@ -197,14 +197,19 @@ interview results.
 
 **Timing and score fields:**
 - `answer_time_sec` is the measured answer duration in seconds. Send `0` when
-  the duration is unavailable; WPM is then `null` rather than estimated.
+  the duration is unavailable; WPM is then `null` rather than estimated. For
+  spoken modes, WPM uses the whole measured response duration, including pauses.
   `answer_mode` is `recorded`, `browser_stt`, or `typed`; typed-answer time is
   excluded from speaking-pace and time scoring.
+- `scores.answer_quality_1_5` is the type-aware answer composite (relevance,
+  depth, fluency, grammar, keywords, and STAR where applicable). The legacy
+  `scores.knowledge_1_5` field is retained as an equivalent alias.
 - `grade` is derived from the overall score: A ≥ 4.5, B ≥ 3.5, C ≥ 2.5,
   D ≥ 1.5, and F below 1.5. Session recommendations use the session average:
   Strong Yes ≥ 4.0, Yes ≥ 3.2, Maybe ≥ 2.5, otherwise No.
 - `star_coverage` is the fraction of STAR components detected. STAR quality is
-  reported separately as `scores.star_quality_1_5`.
+  reported separately as `scores.star_quality_1_5`; the relevance-adjusted STAR
+  contribution used by the composite score is `scores.star_effective_1_5`.
 - `scores.grammar_0_5` is the grammar estimate on a 0–5 scale.
   `grammar_score` is its normalized 0–1 value for skill-gap reports.
 - `evaluation_mode` indicates whether AI reviewer feedback was available;

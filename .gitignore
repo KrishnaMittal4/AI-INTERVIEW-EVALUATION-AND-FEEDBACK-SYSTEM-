@@ -10,6 +10,7 @@ dist/
 build/
 .eggs/
 
+node_modules/
 # Environment secrets — NEVER commit these
 backend/.env
 frontend/.env

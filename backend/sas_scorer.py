@@ -79,7 +79,7 @@ changes required.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,7 @@ _CALIBRATION_THRESHOLD = 0.20
 # LLM score vs embedding score when both are available.
 # LLM is dominant (0.70) because it judges reasoning quality, not just
 # lexical overlap. Embedding fills in paraphrase coverage (0.30).
+_TFIDF_STRETCH = 2.5   # brings TF-IDF onto roughly the calibrated embedding scale
 _LLM_WEIGHT  = 0.70
 _SAS_WEIGHT  = 0.30
 
@@ -134,7 +135,11 @@ def _tfidf_similarity(text_a: str, text_b: str) -> float:
         vect = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True).fit(
             [text_a, text_b])
         vecs = vect.transform([text_a, text_b])
-        return round(float(_cos(vecs[0], vecs[1])[0][0]), 4)
+        sim_matrix = _cos(vecs)          # (2, 2) ndarray; avoids indexing a sparse matrix
+        raw = float(sim_matrix[0][1])
+        # Raw TF-IDF cosine for a good paraphrase is ~0.1-0.3, far below the
+        # calibrated embedding scale; stretch so both paths are comparable.
+        return round(min(1.0, raw * _TFIDF_STRETCH), 4)
     except Exception:
         return 0.0
 
@@ -152,8 +157,8 @@ class SASScorer:
     # Singleton — instantiate once at app startup (model load is slow).
     scorer = SASScorer()
 
-    # Drop-in replacement for _tfidf_fallback():
-    sim = scorer.score(candidate_answer, ideal_answer)          # 0.0–1.0
+    # Returns (similarity 0.0-1.0, method) -- unpack the tuple:
+    sim, method = scorer.score(candidate_answer, ideal_answer)
 
     # Fuse with Groq LLM relevance score:
     final_relevance = scorer.fuse_with_llm(sim, groq_score)    # 0.0–1.0
@@ -161,7 +166,7 @@ class SASScorer:
 
     def __init__(self, model_name: str = _DEFAULT_MODEL) -> None:
         self._model_name = model_name
-        self._model      = None          # lazy-loaded on first score() call
+        self._model: Any = None          # lazy-loaded on first score() call
         self._available  = None          # None = not yet attempted
 
     # ── Model loading ─────────────────────────────────────────────────────────
@@ -249,7 +254,7 @@ class SASScorer:
             # Encode both texts — BGE normalises embeddings by default;
             # dot product of L2-normed vectors equals cosine similarity.
             embs = self._model.encode(
-                [candidate[:1000], reference[:1000]],
+                [candidate[:2000], reference[:2000]],
                 convert_to_numpy=True,
                 normalize_embeddings=True,    # L2 norm → dot product = cosine
                 show_progress_bar=False,
@@ -345,7 +350,7 @@ class SASScorer:
             import numpy as np
             # Filter out empty candidates, preserving index positions
             non_empty_indices = [i for i, c in enumerate(candidates) if c and c.strip()]
-            texts  = [candidates[i][:1000] for i in non_empty_indices] + [reference[:1000]]
+            texts  = [candidates[i][:2000] for i in non_empty_indices] + [reference[:2000]]
             embs   = self._model.encode(
                 texts,
                 convert_to_numpy=True,
@@ -395,3 +400,5 @@ def get_sas_scorer() -> SASScorer:
 
 # Convenience alias
 sas_scorer = get_sas_scorer()
+
+__all__ = ["SASScorer", "get_sas_scorer", "sas_scorer"]

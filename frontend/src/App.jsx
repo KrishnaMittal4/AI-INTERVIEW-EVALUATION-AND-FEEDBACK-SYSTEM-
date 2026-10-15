@@ -6269,7 +6269,10 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
             {/* Rings — FIX: read correct field names from API response */}
             <div style={{display:"flex",justifyContent:"space-around",flexWrap:"wrap",gap:10,marginBottom:18}}>
               <ScoreRing score={evalResult.scores?.overall??evalResult.score??3} label="Overall"/>
-              <ScoreRing score={evalResult.scores?.knowledge_1_5??evalResult.knowledge??3} label="Knowledge"/>
+              <ScoreRing
+                score={evalResult.scores?.answer_quality_1_5??evalResult.scores?.knowledge_1_5??evalResult.answer_quality??evalResult.knowledge??3}
+                label="Answer quality"
+              />
               <ScoreRing
                 score={evalResult.scores?.star_quality_1_5??(evalResult.star_coverage??0)*5}
                 label={evalResult.scores?.star_quality_1_5==null?"STAR coverage":"STAR quality"}
@@ -6315,7 +6318,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
             {/* Stats */}
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
               {[
-                {label:"WPM",val:evalResult.wpm??"N/A",color:evalResult.wpm==null?G.textMut:G.cyan},
+                {label:"WPM (elapsed)",val:evalResult.wpm??"N/A",color:evalResult.wpm==null?G.textMut:G.cyan},
                 {label:"Fillers",val:evalResult.filler_count??0,color:(evalResult.filler_count??0)>5?G.red:G.green},
                 {label:"Nervousness",val:`${((evalResult.nervousness??0.2)*100).toFixed(0)}%`,
                   color:(evalResult.nervousness??0.2)>0.6?G.red:(evalResult.nervousness??0.2)>0.35?G.amber:G.green},
@@ -7976,7 +7979,7 @@ function PageReport({session,answers,incidents=[],onNav}){
 
     const rings=[
       {label:"Overall",score:avg,max:5},
-      {label:"Knowledge",score:answers.reduce((a,x)=>a+(x.knowledge||3),0)/Math.max(answers.length,1),max:5},
+      {label:"Answer quality",score:answers.reduce((a,x)=>a+(x.answer_quality??x.knowledge??3),0)/Math.max(answers.length,1),max:5},
       {label:"STAR",score:avgStar*5,max:5},
       {label:"Composure",score:(1-avgNerv)*5,max:5},
     ];
@@ -8450,7 +8453,7 @@ body{
           <SectionLabel>Score Breakdown</SectionLabel>
           <div style={{display:"flex",justifyContent:"space-around",flexWrap:"wrap",gap:10}}>
             <ScoreRing score={avg} label="Overall" size={82}/>
-            <ScoreRing score={answers.reduce((a,x)=>a+(x.knowledge||3),0)/Math.max(answers.length,1)} label="Knowledge" size={82}/>
+            <ScoreRing score={answers.reduce((a,x)=>a+(x.answer_quality??x.knowledge??3),0)/Math.max(answers.length,1)} label="Answer quality" size={82}/>
             <ScoreRing score={avgStar*5} label="STAR" size={82}/>
             <ScoreRing score={(1-avgNerv)*5} label="Composure" size={82}/>
           </div>
