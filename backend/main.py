@@ -3149,7 +3149,7 @@ async def resume_parse(
             if not raw_text:
                 raise HTTPException(
                     status_code=422,
-                    detail="Could not extract text from PDF. Install pypdf: pip install pypdf"
+                    detail="Could not extract readable text from PDF. Check that it is not password-protected and that any scanned pages are legible."
                 )
         elif filename.endswith(".docx"):
             raw_text = extract_text_from_docx(file_bytes)
@@ -3312,7 +3312,7 @@ async def resume_analyze(
             if not raw_text:
                 raise HTTPException(
                     status_code=422,
-                    detail="PDF text extraction failed. Install pypdf: pip install pypdf"
+                    detail="Could not extract readable text from PDF. Check that it is not password-protected and that any scanned pages are legible."
                 )
         elif filename.endswith(".docx"):
             raw_text = extract_text_from_docx(file_bytes)

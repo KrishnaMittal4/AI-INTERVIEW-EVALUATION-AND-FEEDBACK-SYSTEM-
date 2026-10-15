@@ -111,6 +111,10 @@ keys in GitHub. Keep secrets in the Render environment settings.
   `ALLOWED_ORIGINS=https://ai-interview-evaluation-and-feedbac.vercel.app` in the
   Render dashboard. Set a strong `JWT_SECRET` there too (or let Render generate it).
   Never use the example placeholder API keys.
+- Scanned resume PDFs use OCR when native text extraction finds little or no text.
+  With the service root directory set to `backend`, Render installs the Tesseract
+  executable from `backend/apt.txt`; the Python OCR packages are in
+  `backend/requirements.txt`.
 - Deploy, then check `https://<your-render-service>.onrender.com/health`.
 
 ### 3. Deploy the frontend on Vercel

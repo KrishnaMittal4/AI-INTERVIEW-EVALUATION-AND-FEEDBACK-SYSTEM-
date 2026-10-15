@@ -26,6 +26,9 @@ opencv-python-headless>=4.8.0.76
 
 # PDF Export
 reportlab>=4.0.0
+pypdf>=4.0.0
+PyMuPDF>=1.24.0
+pytesseract>=0.3.10
 
 # ----------------------------------------------------------------------
 # OPTIONAL: Heavy Deep Learning / Acoustic Emotion Pipeline

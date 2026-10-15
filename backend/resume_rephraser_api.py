@@ -69,10 +69,13 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ── SAS scorer (shared singleton — same model instance as analyzer.py) ─────────
 from sas_scorer import sas_scorer as _sas_scorer
@@ -101,6 +104,21 @@ except ImportError:
     except ImportError:
         PYPDF_OK = False
 
+# ── Optional scanned-PDF OCR ──────────────────────────────────────────────────
+_pymupdf: Any = None
+try:
+    import pymupdf as _pymupdf
+    PYMUPDF_OK = True
+except ImportError:
+    PYMUPDF_OK = False
+
+_pytesseract: Any = None
+try:
+    import pytesseract as _pytesseract
+    PYTESSERACT_OK = True
+except ImportError:
+    PYTESSERACT_OK = False
+
 # ── Optional DOCX reader ───────────────────────────────────────────────────────
 try:
     import docx as _docx
@@ -113,15 +131,51 @@ except ImportError:
 #  FILE EXTRACTION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract plain text from PDF bytes. Returns '' if pypdf not installed."""
-    if not PYPDF_OK:
+PDF_OCR_FALLBACK_THRESHOLD = 80
+
+
+def _extract_text_from_pdf_ocr(file_bytes: bytes) -> str:
+    """Render PDF pages and OCR them when native PDF text is unavailable."""
+    if not PYMUPDF_OK or not PYTESSERACT_OK:
+        logger.warning(
+            "PDF OCR is unavailable; install PyMuPDF, pytesseract, and the Tesseract executable."
+        )
         return ""
+
     try:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        return "\n".join(p.extract_text() or "" for p in reader.pages)
+        with _pymupdf.open(stream=file_bytes, filetype="pdf") as document:
+            page_texts = []
+            for page in document:
+                pixmap = page.get_pixmap(
+                    matrix=_pymupdf.Matrix(2, 2),
+                    alpha=False,
+                )
+                page_texts.append(
+                    _pytesseract.image_to_string(
+                        io.BytesIO(pixmap.tobytes("png"))
+                    ).strip()
+                )
+            return "\n".join(page_texts).strip()
     except Exception:
+        logger.warning("Scanned PDF OCR failed.", exc_info=True)
         return ""
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract native PDF text first, falling back to OCR for scanned PDFs."""
+    native_text = ""
+    if PYPDF_OK:
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            native_text = "\n".join(p.extract_text() or "" for p in reader.pages).strip()
+        except Exception:
+            logger.warning("Native PDF text extraction failed.", exc_info=True)
+
+    if len(native_text) >= PDF_OCR_FALLBACK_THRESHOLD:
+        return native_text
+
+    ocr_text = _extract_text_from_pdf_ocr(file_bytes)
+    return ocr_text if len(ocr_text) > len(native_text) else native_text
 
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
