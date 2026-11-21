@@ -461,9 +461,12 @@ def _score_star(text: str) -> float:
 
 
 def _count_fillers(text: str) -> int:
+    # Keep this list in sync with FILLER_WORDS in analyzer.py
     filler_list = [
-        "um","uh","er","ah","hmm","like","you know","sort of",
-        "kind of","basically","literally","i mean","you see",
+        "um", "uh", "er", "ah", "hmm", "uhm",
+        "you know", "sort of", "kind of", "basically", "literally",
+        "i mean", "you see", "okay so", "so yeah", "anyway",
+        "pretty much", "i guess",
     ]
     text_lower = text.lower()
     return sum(len(re.findall(r'\b' + re.escape(w) + r'\b', text_lower)) for w in filler_list)
@@ -1956,7 +1959,10 @@ async def evaluate_answer(
     # Bug fix: if session_scores["final"] is missing, recompute from components rather than
     # silently collapsing to scores["overall"] (which equals knowledge — making Overall == Knowledge).
     emotion_score = round(max(1.0, min(5.0, (1.0 - fused_nervousness) * 5.0)), 2)
-    voice_score   = float(scores.get("fluency") or 3.0)
+    # Bug fix: use explicit None check so a genuine 0.0 fluency score is not
+    # replaced with the neutral default 3.0.
+    _fluency_raw = scores.get("fluency")
+    voice_score  = float(_fluency_raw if _fluency_raw is not None else 3.0)
     overall_score = float(max(0.5, min(5.0, round(
         knowledge_score * SCORE_WEIGHTS["knowledge"]
         + emotion_score * SCORE_WEIGHTS["emotion"]

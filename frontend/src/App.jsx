@@ -1,4 +1,8 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
+import AudioWaveformVisualizer from "./components/AudioWaveformVisualizer";
+import LivePacingBadge from "./components/LivePacingBadge";
+import CompetencyRadarChart from "./components/CompetencyRadarChart";
+import PracticeAttemptDiff from "./components/PracticeAttemptDiff";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
@@ -1794,7 +1798,7 @@ function QuestionQualityPanel({ apiBase = API }) {
   );
 }
 
-function NeuralBackground(){
+function NeuralBackground({ page = "dashboard" }){
   const canvasRef = useRef(null);
 
   useEffect(() => {
@@ -1881,23 +1885,7 @@ function NeuralBackground(){
         mouse.y = -1000;
       }
 
-      // ── 1. Structured Precision Micro-Grid Matrix ──────────────────────────
-      const GRID_STEP = 36;
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.035)';
-      const startX = (frame * 0.05) % GRID_STEP;
-      for (let x = startX; x < W; x += GRID_STEP) {
-        for (let y = 0; y < H; y += GRID_STEP) {
-          // Subtle radial falloff from center
-          const dx = x - W / 2;
-          const dy = y - H / 2;
-          const distCenter = Math.sqrt(dx * dx + dy * dy);
-          if (distCenter < W * 0.75) {
-            ctx.beginPath();
-            ctx.arc(x, y, 0.7, 0, Math.PI * 2);
-            ctx.fill();
-          }
-        }
-      }
+      // ── 1. Micro-Grid Matrix is now GPU-accelerated via CSS layer for silky 60fps performance
 
       // ── 2. Biometric / Voice Acoustic Harmonic Waves ───────────────────────
       // Subtle flowing audio spectrum ribbons simulating live vocal evaluation
@@ -2083,7 +2071,7 @@ function NeuralBackground(){
     draw();
 
     return () => {
-      cancelAnimationFrame(raf);
+      if (raf) cancelAnimationFrame(raf);
       window.removeEventListener('resize', resize);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseleave', onMouseLeave);
@@ -2092,7 +2080,7 @@ function NeuralBackground(){
 
   return (
     <>
-      {/* ── Deep Slate / Dark Navy Base ───────────────────────────────────── */}
+      {/* ── Deep Slate / Dark Navy Base with GPU-Accelerated Micro-Grid ── */}
       <div
         style={{
           position: 'fixed',
@@ -2102,7 +2090,9 @@ function NeuralBackground(){
           height: '100%',
           zIndex: 0,
           pointerEvents: 'none',
-          background: 'radial-gradient(ellipse 90% 70% at 50% 15%, #0d1527 0%, #080c14 65%, #05080f 100%)',
+          backgroundColor: '#080c14',
+          backgroundImage: 'radial-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px), radial-gradient(ellipse 90% 70% at 50% 15%, #0d1527 0%, #080c14 65%, #05080f 100%)',
+          backgroundSize: '36px 36px, 100% 100%',
         }}
       />
 
@@ -2136,7 +2126,7 @@ function NeuralBackground(){
         }}
       />
 
-      {/* ── Main Canvas (Micro-Grid + Biometric Waves + Interactive Nodes) ── */}
+      {/* ── Main Canvas (Biometric Waves + Interactive Nodes) ── */}
       <canvas
         ref={canvasRef}
         style={{
@@ -2147,6 +2137,8 @@ function NeuralBackground(){
           height: '100%',
           zIndex: 2,
           pointerEvents: 'none',
+          opacity: page === "live" ? 0.38 : 0.88,
+          transition: 'opacity 0.8s ease',
         }}
       />
 
@@ -5392,6 +5384,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
   const webcamFramesRef=useRef([]);
   const[webcamResult,setWebcamResult]=useState(null);
   const[coherenceReport,setCoherenceReport]=useState(null); // Feature 6: live coherence
+  const[audioStream,setAudioStream]=useState(null);
   const{speaking,speak,stop:stopTTS}=useTTS();
   const mediaRef=useRef(null);
   const chunksRef=useRef([]);
@@ -5493,11 +5486,13 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
     try{
       setTranscriptionError("");
       const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+      setAudioStream(stream);
       const mr=new MediaRecorder(stream);
       chunksRef.current=[];
       mr.ondataavailable=e=>chunksRef.current.push(e.data);
       mr.onstop=async()=>{
         stream.getTracks().forEach(t=>t.stop());
+        setAudioStream(null);
         stopTimer();
         const blob=new Blob(chunksRef.current,{type:mr.mimeType||"audio/webm"});
         if(!blob.size){
@@ -5543,6 +5538,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
     autoSubmitRef.current=true;   // flag: submit as soon as transcript arrives
     mediaRef.current?.stop();
     setRecording(false);
+    setAudioStream(null);
   };
 
   // Submit — accepts optional answerText override (for auto-submit after transcription)
@@ -6127,9 +6123,11 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
                 {recording&&<span style={{fontSize:11,color:G.red,fontFamily:G.mono,animation:"pulse 1s infinite"}}>● REC {fmtTime(timer)}</span>}
                 {loading&&<span style={{fontSize:11,color:G.cyan}}>⚙ Transcribing via Gemini (Groq Whisper fallback)…</span>}
               </div>
+              <AudioWaveformVisualizer stream={audioStream} isRecording={recording} />
               <Btn onClick={recording?stopRec:startRec} color={recording?G.red:G.green} disabled={loading}>
                 {recording?"⏹ STOP RECORDING":"⏺ RECORD AUDIO"}
               </Btn>
+              <LivePacingBadge wordCount={answer.split(/\s+/).filter(Boolean).length} elapsedSeconds={timer} isRecording={recording||timerOn} />
               {answer&&!loading&&(
                 <div style={{marginTop:12}}>
                   <div style={{fontSize:10,color:G.textMut,marginBottom:6,letterSpacing:"0.08em"}}>TRANSCRIPT — EDIT IF NEEDED</div>
@@ -6232,6 +6230,15 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
 
         {evalResult&&(
           <Card glow style={{borderColor:`${G.green}28`,background:G.glass,backdropFilter:G.blur,WebkitBackdropFilter:G.blur}}>
+            {/* Feature 1: Practice Attempt Side-by-Side Comparison */}
+            {previousPracticeAttempt&&(
+              <PracticeAttemptDiff
+                previousAttempt={previousPracticeAttempt}
+                currentResult={evalResult}
+                onRetryAgain={retryAnswer}
+              />
+            )}
+
             <div style={{padding:"13px 15px",marginBottom:16,borderRadius:9,
               background:`${G.cyan}0b`,border:`1px solid ${G.cyan}28`}}>
               <div style={{fontSize:10,color:G.cyan,fontFamily:G.head,fontWeight:700,
@@ -6240,15 +6247,6 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
               <div style={{fontSize:10,color:G.textMut,lineHeight:1.55,marginTop:6}}>
                 Feedback is a practice aid, not a judgment of your ability. You can retry whenever you’re ready.
               </div>
-              {previousPracticeAttempt&&(
-                <div style={{fontSize:11,color:G.textMut,marginTop:9}}>
-                  Previous try{practiceScore(previousPracticeAttempt.result)
-                    ? `: ${practiceScore(previousPracticeAttempt.result)}/5`
-                    : ""}{" · "}This try{practiceScore(evalResult)
-                    ? `: ${practiceScore(evalResult)}/5`
-                    : ""}. Use the feedback as a guide, not a target score.
-                </div>
-              )}
               <Btn onClick={retryAnswer} color={G.cyan}
                 style={{fontSize:11,padding:"7px 12px",marginTop:11,borderRadius:7}}>
                 ↻ PRACTICE THIS ANSWER AGAIN
@@ -6279,6 +6277,9 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
               />
               <ScoreRing score={(1-(evalResult.nervousness??0.2))*5} label={composureLabel}/>
             </div>
+
+            {/* Feature 4: 6-Axis Interactive Competency Radar Chart */}
+            <CompetencyRadarChart scores={{ ...evalResult.scores, nervousness: evalResult.nervousness }} size={240} />
 
             {/* Grade badge */}
             {evalResult.grade&&(
@@ -9579,124 +9580,123 @@ function PageResume({onNav,onStartWithQuestions}){
   };
 
   return(
-    <div style={{animation:"fadeIn 0.4s ease"}}>
-      {/* Pipeline progress when loading */}
-      {loading&&step>=0&&(
-        <ResumeProgressBar step={step} total={4} labels={STEPS}/>
-      )}
-      {tab==="upload"?<UploadPanel/>:<ResultsPanel/>}
+    <div style={{maxWidth:960,margin:"0 auto",padding:"0 0 60px"}}>
+      {tab==="upload"&&<UploadPanel/>}
+      {tab==="results"&&<ResultsPanel/>}
     </div>
   );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  SHARED ANSWER INPUT PANEL
-//  Reused by PageHR and PageBenchmark — Whisper · Browser STT · Type
+//  ANSWER INPUT PANEL (Shared between HR Practice & custom flows)
 // ══════════════════════════════════════════════════════════════════════════════
-function AnswerInputPanel({value, onChange, onSubmit, submitLabel="⚡ SUBMIT ANSWER", submitDisabled=false, accentColor=G.cyan, placeholder="Type or record your answer…", rows=5}){
+function AnswerInputPanel({
+  value="",
+  onChange=()=>{},
+  onSubmit=()=>{},
+  submitLabel="⚡ SUBMIT ANSWER",
+  submitDisabled=false,
+  accentColor=G.cyan,
+  placeholder="Type your answer...",
+  rows=6,
+  isActive=false,
+}){
   const[inputTab,setInputTab]=useState("whisper");
   const[recording,setRecording]=useState(false);
   const[transcribing,setTranscribing]=useState(false);
   const[transcriptionError,setTranscriptionError]=useState("");
   const[listening,setListening]=useState(false);
   const[interim,setInterim]=useState("");
-  const mediaRef=useRef(null);
-  const chunksRef=useRef([]);
+  const mediaRecorderRef=useRef(null);
+  const audioChunksRef=useRef([]);
   const sttRef=useRef(null);
 
   const inputTabs=[
     {id:"whisper",label:"🎙 Cloud AI"},
     {id:"browser",label:"🌐 Browser STT"},
-    {id:"type",   label:"⌨ Type"},
+    {id:"type",label:"⌨ Type"},
   ];
 
-  // ── Whisper (Groq) ────────────────────────────────────────────────────────
   const startWhisper=async()=>{
     try{
       setTranscriptionError("");
       const stream=await navigator.mediaDevices.getUserMedia({audio:true});
       const mr=new MediaRecorder(stream);
-      chunksRef.current=[];
-      mr.ondataavailable=e=>chunksRef.current.push(e.data);
+      mediaRecorderRef.current=mr;
+      audioChunksRef.current=[];
+      mr.ondataavailable=e=>{if(e.data&&e.data.size>0)audioChunksRef.current.push(e.data);};
       mr.onstop=async()=>{
         stream.getTracks().forEach(t=>t.stop());
-        const blob=new Blob(chunksRef.current,{type:mr.mimeType||"audio/webm"});
-        if(!blob.size){
-          setTranscriptionError("No audio was recorded. Check microphone access and try again.");
-          return;
-        }
+        const blob=new Blob(audioChunksRef.current,{type:mr.mimeType||"audio/webm"});
         setTranscribing(true);
         try{
           const form=new FormData();
-          const extension=(mr.mimeType||"audio/webm").includes("mp4")?"mp4":"webm";
-          form.append("audio",blob,`rec.${extension}`);
-          // reuse existing /transcribe route — no session_id needed for HR/bench
+          form.append("audio",blob,"answer.webm");
           const res=await authFetch(`${API}/transcribe`,{method:"POST",body:form});
-          const d=await res.json();
-          if(!res.ok)throw new Error(d.detail||`Transcription request failed (${res.status})`);
-          const transcript=(d.transcript||"").trim();
-          if(!transcript)throw new Error("No speech was detected in the recording.");
-          onChange(prev=>(prev?prev+" ":"")+transcript);
-        }catch(e){
-          console.error("Whisper error",e);
-          setTranscriptionError(e.message||"Transcription failed. Try recording again.");
+          if(res.ok){
+            const d=await res.json();
+            if(d.transcript){
+              onChange(prev=>prev?(prev+" "+d.transcript):d.transcript);
+            }
+          }else{
+            setTranscriptionError("Transcription failed. Please type your answer.");
+          }
+        }catch(err){
+          setTranscriptionError("Transcription network error.");
+        }finally{
+          setTranscribing(false);
         }
-        finally{setTranscribing(false);}
       };
       mr.start();
-      mediaRef.current=mr;
       setRecording(true);
-    }catch{alert("Microphone access denied.");}
+    }catch(err){
+      setTranscriptionError("Microphone access denied or unavailable.");
+    }
   };
 
   const stopWhisper=()=>{
-    mediaRef.current?.stop();
+    if(mediaRecorderRef.current&&mediaRecorderRef.current.state!=="inactive"){
+      mediaRecorderRef.current.stop();
+    }
     setRecording(false);
   };
 
-  // ── Browser STT ───────────────────────────────────────────────────────────
   const toggleBrowserSTT=()=>{
+    const SpeechRec=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(!SpeechRec){
+      alert("Browser STT is not supported in this browser. Please use Chrome/Edge or Cloud AI.");
+      return;
+    }
     if(listening){
       sttRef.current?.stop();
       setListening(false);
       setInterim("");
       return;
     }
-    const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-    if(!SR){alert("Browser STT requires Chrome or Edge.");return;}
-    const r=new SR();
-    r.continuous=true;r.interimResults=true;r.lang="en-US";
-    r.onresult=e=>{
-      let fin="",inter="";
+    const rec=new SpeechRec();
+    rec.continuous=true;
+    rec.interimResults=true;
+    rec.lang="en-US";
+    rec.onresult=e=>{
+      let intText="";
       for(let i=e.resultIndex;i<e.results.length;i++){
-        if(e.results[i].isFinal)fin+=e.results[i][0].transcript+" ";
-        else inter+=e.results[i][0].transcript;
+        if(e.results[i].isFinal){
+          onChange(prev=>prev?(prev+" "+e.results[i][0].transcript):e.results[i][0].transcript);
+        }else{
+          intText+=e.results[i][0].transcript;
+        }
       }
-      if(fin)onChange(prev=>(prev?prev+" ":"")+fin.trim());
-      setInterim(inter);
+      setInterim(intText);
     };
-    r.onerror=()=>{setListening(false);setInterim("");};
-    r.onend=()=>{setListening(false);setInterim("");};
-    r.start();
-    sttRef.current=r;
+    rec.onerror=()=>{setListening(false);setInterim("");};
+    rec.onend=()=>{setListening(false);setInterim("");};
+    sttRef.current=rec;
+    rec.start();
     setListening(true);
   };
 
-  const isActive=recording||listening;
-
   return(
-    <Card style={{background:G.glass,backdropFilter:G.blur,WebkitBackdropFilter:G.blur}}>
-      {/* Recording red pulse bar at top */}
-      {isActive&&(
-        <div style={{
-          height:2,background:`linear-gradient(90deg,transparent,${G.red},transparent)`,
-          marginBottom:0,marginLeft:-16,marginRight:-16,marginTop:-16,
-          borderRadius:"12px 12px 0 0",boxShadow:`0 0 8px ${G.red}`,
-          animation:"pulse 1s infinite",
-        }}/>
-      )}
-
-      {/* Tab row */}
+    <Card glow style={{background:G.glass,backdropFilter:G.blur,WebkitBackdropFilter:G.blur,borderColor:`${accentColor}25`}}>
       <div style={{
         display:"flex",gap:0,
         borderBottom:`1px solid ${G.border}`,
@@ -11747,7 +11747,7 @@ export default function App(){
   return(
     <>
       <style>{GLOBAL_CSS}</style>
-      <NeuralBackground/>
+      <NeuralBackground page={page} />
       {activeAchieve&&<AchievementToast achievement={activeAchieve} onDone={()=>setActiveAchieve(null)}/>}
       {levelUpRank&&<LevelUpFlash rank={levelUpRank} onDone={()=>setLevelUpRank(null)}/>}
       {authModalOpen&&(

@@ -92,7 +92,7 @@ async def _call_groq(
         if not m:
             continue
         try:
-            extra: Dict[str, Any] = {"reasoning_effort": "low"} if "gpt-oss" in m else {}
+            extra: Dict[str, Any] = {}
             if json_mode:
                 extra["response_format"] = {"type": "json_object"}
             try:
