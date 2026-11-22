@@ -1,4 +1,8 @@
 /**
+ * Copyright (c) 2026 Krishna Mittal.
+ * All Rights Reserved.
+ * See LICENSE for usage restrictions.
+ *
  * Centralized Text-to-Speech (TTS) Service
  * Clean abstraction layer over Web Speech API (SpeechSynthesis)
  * with support for future cloud TTS provider swaps (ElevenLabs, Google Cloud TTS, etc.)

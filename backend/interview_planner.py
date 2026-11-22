@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 Dynamic Interview Planner — Phase 3
 Generates a topic/time plan before the interview starts and maintains

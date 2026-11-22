@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 adaptive_sequencer.py — Aura AI | RL-Based Adaptive Question Sequencer (v3.0)
 ==============================================================================

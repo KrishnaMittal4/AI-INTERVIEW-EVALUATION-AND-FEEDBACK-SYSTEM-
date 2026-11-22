@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 Progress Tracker — Phase 5
 Aggregates skill scores across sessions, detects recurring weaknesses,

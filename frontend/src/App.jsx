@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 Krishna Mittal.
+ * All Rights Reserved.
+ * See LICENSE for usage restrictions.
+ */
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import AudioWaveformVisualizer from "./components/AudioWaveformVisualizer";
 import LivePacingBadge from "./components/LivePacingBadge";
@@ -12002,6 +12007,23 @@ export default function App(){
             <PageReport session={session} answers={sessionAnswers} incidents={sessionIncidents} onNav={nav}/>
           )}
         </div>
+
+        {/* ── Footer ── */}
+        <footer style={{
+          textAlign: "center",
+          padding: "24px 16px 36px",
+          borderTop: "1px solid rgba(255,255,255,0.06)",
+          marginTop: 40,
+          color: G.textMut,
+          fontSize: 11,
+          fontFamily: G.mono,
+          lineHeight: 1.6,
+        }}>
+          <div>© 2026 Krishna Mittal. All Rights Reserved.</div>
+          <div style={{color: G.textDim, fontSize: 10, marginTop: 4}}>
+            AI Interview Evaluation & Feedback System. Unauthorized copying, redistribution, or commercial use is prohibited.
+          </div>
+        </footer>
       </div>
     </>
   );

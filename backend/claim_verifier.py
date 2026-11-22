@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 Claim Verifier — Phase 2
 Generates 5-level depth challenge questions for skills claimed on the resume

@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 analyzer_v3.py — Aura AI | Interview Analysis Engine (v3.0)
 ============================================================

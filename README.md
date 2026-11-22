@@ -290,3 +290,18 @@ ai-interview-analyzer/
 │   └── package.json
 └── docker-compose.yml
 ```
+
+---
+
+## 🔒 License & Intellectual Property
+
+Copyright © 2026 Krishna Mittal. All Rights Reserved.
+
+This project is proprietary software and is publicly available for
+portfolio, recruitment, demonstration, and evaluation purposes only.
+
+You may view and evaluate the source code, but copying, modification,
+redistribution, commercial use, or creation of derivative works is
+not permitted without prior written permission.
+
+See the [LICENSE](./LICENSE) file for details.

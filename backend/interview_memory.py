@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 Interview Memory — Phase 2
 Extracts structured facts from each answer and maintains session-level memory.

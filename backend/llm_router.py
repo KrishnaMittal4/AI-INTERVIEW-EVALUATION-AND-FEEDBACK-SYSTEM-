@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Krishna Mittal.
+# All Rights Reserved.
+# See LICENSE for usage restrictions.
+
 """
 llm_router.py — Multi-Provider LLM Router with Automatic Failover
 ===================================================================
