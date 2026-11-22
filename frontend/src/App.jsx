@@ -3,6 +3,12 @@ import AudioWaveformVisualizer from "./components/AudioWaveformVisualizer";
 import LivePacingBadge from "./components/LivePacingBadge";
 import CompetencyRadarChart from "./components/CompetencyRadarChart";
 import PracticeAttemptDiff from "./components/PracticeAttemptDiff";
+import ConversationTranscript from "./components/ConversationTranscript";
+import InterviewStateBadge from "./components/InterviewStateBadge";
+import TTSControls from "./components/TTSControls";
+import AnswerCoachPanel from "./components/AnswerCoachPanel";
+import ProgressDashboard from "./components/ProgressDashboard";
+import { tts } from "./services/ttsService";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
@@ -3805,10 +3811,17 @@ function PageDashboard({onNav,sessions,xp=0,onXP}){
       </div>
 
       {/* DAILY CHALLENGE */}
-      <div style={{marginBottom:6}}>
+      <div style={{marginBottom:20}}>
         <div style={{fontSize:11,color:G.textMut,letterSpacing:"0.15em",fontFamily:G.head,marginBottom:10}}>◈ TODAY'S CHALLENGE</div>
         <DailyChallenge onXP={onXP}/>
       </div>
+
+      {/* Phase 5: Multi-Session Skill Progress & Weakness Tracker */}
+      {getToken() && (
+        <div style={{marginBottom:24}}>
+          <ProgressDashboard authToken={getToken()} />
+        </div>
+      )}
 
       {/* PAST SESSIONS */}
       {sessions.length>0&&(
@@ -3863,6 +3876,7 @@ function PageSetup({onStart}){
   const[resumeParsed,setResumeParsed]=useState(null);
   const[resumeParsing,setResumeParsing]=useState(false);
   const[isHrMode,setIsHrMode]=useState(false); // Most important HR Interview Questions Mode
+  const[interviewMode,setInterviewMode]=useState("practice"); // "practice" | "mock"
   const[companyPack,setCompanyPack]=useState("no_pack");
   const[loading,setLoading]=useState(false);
   const[error,setError]=useState("");
@@ -4002,6 +4016,7 @@ function PageSetup({onStart}){
       form.append("resume_text",effectiveResume);
       form.append("resume_parsed_json",effectiveResume&&resumeParsed?JSON.stringify(resumeParsed):"");
       form.append("company_pack",effectivePack);
+      form.append("mode",interviewMode); // Phase 1: mode (practice|mock)
       const res=await authFetch(`${API}/session/start`,{method:"POST",body:form});
       if(!res.ok)throw new Error((await res.json()).detail||"Failed");
       const data=await res.json();
@@ -4013,6 +4028,7 @@ function PageSetup({onStart}){
         syllabusWeights:data.syllabus_weights,
         isHrMode,
         hasResume:!!effectiveResume,
+        mode:data.mode||interviewMode, // Phase 1: pass mode through
       });
     }catch(e){
       // Dev mode fallback questions
@@ -4342,6 +4358,42 @@ function PageSetup({onStart}){
                 <input type="checkbox" checked={isHrMode} onChange={e=>setIsHrMode(e.target.checked)}
                   style={{width:22,height:22,accentColor:"#8b5cf6",cursor:"pointer"}}/>
               </label>
+            </div>
+          </div>
+
+          {/* ── Phase 1: Practice Mode vs Realistic Mock Mode ─────────────── */}
+          <div style={{marginBottom:22}}>
+            <div style={{fontSize:11,color:G.textMut,marginBottom:10,fontWeight:600}}>
+              INTERVIEW FORMAT & MODE
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+              <button type="button" onClick={()=>setInterviewMode("practice")} style={{
+                padding:"13px 14px",borderRadius:8,cursor:"pointer",textAlign:"left",
+                border:`1.5px solid ${interviewMode==="practice"?G.cyan:"rgba(255,255,255,0.08)"}`,
+                background:interviewMode==="practice"?"rgba(6,182,212,0.1)":"rgba(255,255,255,0.02)",
+                color:interviewMode==="practice"?G.cyan:"#94a3b8",transition:"all 0.2s",
+              }}>
+                <div style={{fontSize:13,fontWeight:700,display:"flex",alignItems:"center",gap:8}}>
+                  <span>🎯</span> Practice Mode
+                </div>
+                <div style={{fontSize:11,opacity:0.8,marginTop:4}}>
+                  Real-time scores, spoken coaching, answer structure diagnosis & retry
+                </div>
+              </button>
+
+              <button type="button" onClick={()=>setInterviewMode("mock")} style={{
+                padding:"13px 14px",borderRadius:8,cursor:"pointer",textAlign:"left",
+                border:`1.5px solid ${interviewMode==="mock"?G.violet:"rgba(255,255,255,0.08)"}`,
+                background:interviewMode==="mock"?"rgba(139,92,246,0.1)":"rgba(255,255,255,0.02)",
+                color:interviewMode==="mock"?G.violet:"#94a3b8",transition:"all 0.2s",
+              }}>
+                <div style={{fontSize:13,fontWeight:700,display:"flex",alignItems:"center",gap:8}}>
+                  <span>💼</span> Realistic Mock Mode
+                </div>
+                <div style={{fontSize:11,opacity:0.8,marginTop:4}}>
+                  Scores hidden during interview, natural interviewer reactions & final debrief
+                </div>
+              </button>
             </div>
           </div>
 
@@ -5358,6 +5410,21 @@ function WhiteboardPanel({open,onClose}){
 }
 
 function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
+  // ── Phase 1: Interview State Machine ──────────────────────────────────────
+  const INTERVIEW_STATES={
+    IDLE:"idle",INTRODUCTION:"introduction",SPEAKING:"speaking",
+    WAITING:"waiting",RECORDING:"recording",TRANSCRIBING:"transcribing",
+    EVALUATING:"evaluating",GENERATING_FEEDBACK:"generating_feedback",
+    SPEAKING_FEEDBACK:"speaking_feedback",GENERATING_NEXT:"generating_next",
+    PAUSED:"paused",COMPLETED:"completed",ERROR:"error",
+  };
+  const[interviewState,setInterviewState]=useState(INTERVIEW_STATES.IDLE);
+  const[sessionMode]=useState(session.mode||"practice");
+  const[transcript,setTranscript]=useState([]); // Phase 1: conversation transcript
+  const[memoryDelta,setMemoryDelta]=useState(null); // Phase 2: memory
+  const[answerCoach,setAnswerCoach]=useState(null); // Phase 4: coaching
+  const[spokenFeedback,setSpokenFeedback]=useState(""); // Phase 1: spoken feedback text
+
   const[question,setQuestion]=useState(session.firstQuestion);
   const[qIndex,setQIndex]=useState(0);
   const[answers,setAnswers]=useState([]);
@@ -5438,7 +5505,16 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
     const text=question?.question||question;
     if(text&&typeof text==="string"){
       // small delay so browser voices are ready
-      const t=setTimeout(()=>speak(text),400);
+      setInterviewState(INTERVIEW_STATES.SPEAKING);
+      // Add to transcript
+      setTranscript(prev=>[...prev,{
+        role:"ai",text,type:question?.type||"question",
+        timestamp:new Date().toLocaleTimeString(),
+      }]);
+      const t=setTimeout(()=>tts.speak(text,{
+        type:"question",
+        onEnd:()=>setInterviewState(INTERVIEW_STATES.WAITING),
+      }),400);
       return()=>clearTimeout(t);
     }
   },[question]);
@@ -5527,7 +5603,8 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
         }
         finally{setLoading(false);}
       };
-      mr.start();mediaRef.current=mr;setRecording(true);startTimer();stopTTS();
+      tts.stop(); // Phase 1: CRITICAL — stop AI speech before mic activates
+      mr.start();mediaRef.current=mr;setRecording(true);startTimer();setInterviewState(INTERVIEW_STATES.RECORDING);stopTTS();
     }catch{alert("Microphone access denied.");}
   },[session,startTimer,stopTimer,stopTTS]);
 
@@ -5547,6 +5624,12 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
     if(!text||submitting||evalResult)return;
     const answerDurationSeconds=stopTimer();
     setSubmitting(true);setEvaluationError("");
+    setInterviewState(INTERVIEW_STATES.EVALUATING); // Phase 1: state
+    // Add candidate answer to transcript
+    setTranscript(prev=>[...prev,{
+      role:"candidate",text,
+      timestamp:new Date().toLocaleTimeString(),
+    }]);
     try{
       const form=new FormData();
       form.append("session_id",session.sessionId);
@@ -5597,8 +5680,33 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       if(retrying)replaceLastAnswer(na);
       else addAnswer(na);
       setRetrying(false);
+
+      // ── Phase 2: Store memory delta ──────────────────────────────────────
+      if(data.memory_delta)setMemoryDelta(data.memory_delta);
+
+      // ── Phase 4: Answer coaching ──────────────────────────────────────────
+      if(data.answer_coach)setAnswerCoach(data.answer_coach);
+
+      // ── Phase 1: Speak feedback (after evaluation) ────────────────────────
+      const fbText=data.spoken_feedback||"";
+      if(fbText){
+        setSpokenFeedback(fbText);
+        setInterviewState(INTERVIEW_STATES.SPEAKING_FEEDBACK);
+        // Add AI feedback to transcript
+        setTranscript(prev=>[...prev,{
+          role:"ai",text:fbText,type:"feedback",
+          timestamp:new Date().toLocaleTimeString(),
+        }]);
+        tts.speak(fbText,{
+          type:"feedback",
+          onEnd:()=>setInterviewState(INTERVIEW_STATES.WAITING),
+        });
+      } else {
+        setInterviewState(INTERVIEW_STATES.WAITING);
+      }
     }catch(e){
       setEvaluationError(e.message||"Evaluation failed. Check your connection and try again.");
+      setInterviewState(INTERVIEW_STATES.ERROR);
     }finally{setSubmitting(false);}
   };
 
@@ -5794,6 +5902,7 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
       setWebcamFrames([]);setWebcamResult(null);
+      setAnswerCoach(null);setSpokenFeedback("");setMemoryDelta(null);
       return;
     }
 
@@ -5826,6 +5935,9 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
       setFollowUp(null);setFollowUpAnswer("");setFollowUpEval(null);
       webcamFramesRef.current=[];
       setWebcamFrames([]);setWebcamResult(null);
+      // Phase 1/4: reset coaching state for next question
+      setAnswerCoach(null);setSpokenFeedback("");setMemoryDelta(null);
+      setInterviewState(INTERVIEW_STATES.SPEAKING);
     }
   };
 
@@ -5986,6 +6098,31 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
         </div>
 
         {/* Question Card — Large and prominent */}
+        {/* Phase 1: State Badge + TTS Controls */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:8}}>
+          <InterviewStateBadge state={interviewState}/>
+          <TTSControls style={{flex:1,minWidth:0}}/>
+        </div>
+
+        {/* Phase 1: Conversation Transcript */}
+        <ConversationTranscript entries={transcript} isVisible={transcript.length>0}/>
+
+        {/* Phase 1: Spoken Feedback display (also shown as text) */}
+        {spokenFeedback&&evalResult&&(
+          <div style={{
+            padding:"12px 16px",marginBottom:14,
+            background:"rgba(0,212,255,0.06)",
+            border:`1px solid rgba(0,212,255,0.25)`,
+            borderRadius:10,fontSize:13,color:"#e8eaf6",lineHeight:1.7,
+            animation:"fadeIn 0.4s ease",
+          }}>
+            <span style={{fontSize:10,color:"#00d4ff",fontFamily:"'JetBrains Mono',monospace",display:"block",marginBottom:6}}>
+              🎙 AI FEEDBACK
+            </span>
+            {spokenFeedback}
+          </div>
+        )}
+
         <Card glow style={{
           background:G.glass,backdropFilter:G.blur,WebkitBackdropFilter:G.blur,
           borderColor:`${typeColor}35`,
@@ -6239,47 +6376,67 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
               />
             )}
 
-            <div style={{padding:"13px 15px",marginBottom:16,borderRadius:9,
-              background:`${G.cyan}0b`,border:`1px solid ${G.cyan}28`}}>
-              <div style={{fontSize:10,color:G.cyan,fontFamily:G.head,fontWeight:700,
-                letterSpacing:"0.1em",marginBottom:6}}>ONE THING TO PRACTICE</div>
-              <div style={{fontSize:12,color:G.textPri,lineHeight:1.65}}>{practiceTip}</div>
-              <div style={{fontSize:10,color:G.textMut,lineHeight:1.55,marginTop:6}}>
-                Feedback is a practice aid, not a judgment of your ability. You can retry whenever you’re ready.
-              </div>
-              <Btn onClick={retryAnswer} color={G.cyan}
-                style={{fontSize:11,padding:"7px 12px",marginTop:11,borderRadius:7}}>
-                ↻ PRACTICE THIS ANSWER AGAIN
-              </Btn>
-            </div>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
-              <SectionLabel color={G.green}>EVALUATION RESULT</SectionLabel>
-              <div style={{display:"flex",alignItems:"center",gap:6}}>
-                <div style={{width:8,height:8,borderRadius:"50%",background:G.green,boxShadow:`0 0 8px ${G.green}`,animation:"pulse 1s infinite"}}/>
-                <span style={{fontSize:9,fontFamily:G.head,color:G.green,letterSpacing:"0.1em"}}>
-                  {evalResult.evaluation_mode==="ai"
-                    ?"AI REVIEW · RULE-BASED SCORE"
-                    :"LOCAL ESTIMATE"}
-                </span>
-              </div>
-            </div>
+            {/* Phase 4: Answer Coach Panel */}
+            <AnswerCoachPanel
+              coachData={answerCoach}
+              mode={sessionMode}
+              onRetry={retryAnswer}
+            />
 
-            {/* Rings — FIX: read correct field names from API response */}
-            <div style={{display:"flex",justifyContent:"space-around",flexWrap:"wrap",gap:10,marginBottom:18}}>
-              <ScoreRing score={evalResult.scores?.overall??evalResult.score??3} label="Overall"/>
-              <ScoreRing
-                score={evalResult.scores?.answer_quality_1_5??evalResult.scores?.knowledge_1_5??evalResult.answer_quality??evalResult.knowledge??3}
-                label="Answer quality"
-              />
-              <ScoreRing
-                score={evalResult.scores?.star_quality_1_5??(evalResult.star_coverage??0)*5}
-                label={evalResult.scores?.star_quality_1_5==null?"STAR coverage":"STAR quality"}
-              />
-              <ScoreRing score={(1-(evalResult.nervousness??0.2))*5} label={composureLabel}/>
-            </div>
+            {/* Phase 3: Practice Mode vs Realistic Mock Mode Presentation */}
+            {sessionMode === "mock" ? (
+              <div style={{padding:"20px 22px",borderRadius:10,background:"rgba(139,92,246,0.08)",border:`1px solid ${G.violet}40`,margin:"16px 0",textAlign:"center"}}>
+                <div style={{fontSize:24,marginBottom:8}}>💼</div>
+                <div style={{fontSize:13,fontWeight:700,color:G.violet,fontFamily:G.head,letterSpacing:"0.08em",marginBottom:6}}>
+                  REALISTIC MOCK MODE ACTIVE
+                </div>
+                <div style={{fontSize:12,color:G.textPri,lineHeight:1.65,maxWidth:520,margin:"0 auto"}}>
+                  Your response has been transcribed and evaluated. In realistic mock mode, numerical scores and granular rubrics are withheld to maintain authentic interview conditions. Full analytics will appear in your completion debrief.
+                </div>
+              </div>
+            ) : (
+              <React.Fragment>
+                <div style={{padding:"13px 15px",marginBottom:16,borderRadius:9,
+                  background:`${G.cyan}0b`,border:`1px solid ${G.cyan}28`}}>
+                  <div style={{fontSize:10,color:G.cyan,fontFamily:G.head,fontWeight:700,
+                    letterSpacing:"0.1em",marginBottom:6}}>ONE THING TO PRACTICE</div>
+                  <div style={{fontSize:12,color:G.textPri,lineHeight:1.65}}>{practiceTip}</div>
+                  <div style={{fontSize:10,color:G.textMut,lineHeight:1.55,marginTop:6}}>
+                    Feedback is a practice aid, not a judgment of your ability. You can retry whenever you’re ready.
+                  </div>
+                  <Btn onClick={retryAnswer} color={G.cyan}
+                    style={{fontSize:11,padding:"7px 12px",marginTop:11,borderRadius:7}}>
+                    ↻ PRACTICE THIS ANSWER AGAIN
+                  </Btn>
+                </div>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+                  <SectionLabel color={G.green}>EVALUATION RESULT</SectionLabel>
+                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:G.green,boxShadow:`0 0 8px ${G.green}`,animation:"pulse 1s infinite"}}/>
+                    <span style={{fontSize:9,fontFamily:G.head,color:G.green,letterSpacing:"0.1em"}}>
+                      {evalResult.evaluation_mode==="ai"
+                        ?"AI REVIEW · RULE-BASED SCORE"
+                        :"LOCAL ESTIMATE"}
+                    </span>
+                  </div>
+                </div>
 
-            {/* Feature 4: 6-Axis Interactive Competency Radar Chart */}
-            <CompetencyRadarChart scores={{ ...evalResult.scores, nervousness: evalResult.nervousness }} size={240} />
+                {/* Rings — FIX: read correct field names from API response */}
+                <div style={{display:"flex",justifyContent:"space-around",flexWrap:"wrap",gap:10,marginBottom:18}}>
+                  <ScoreRing score={evalResult.scores?.overall??evalResult.score??3} label="Overall"/>
+                  <ScoreRing
+                    score={evalResult.scores?.answer_quality_1_5??evalResult.scores?.knowledge_1_5??evalResult.answer_quality??evalResult.knowledge??3}
+                    label="Answer quality"
+                  />
+                  <ScoreRing
+                    score={evalResult.scores?.star_quality_1_5??(evalResult.star_coverage??0)*5}
+                    label={evalResult.scores?.star_quality_1_5==null?"STAR coverage":"STAR quality"}
+                  />
+                  <ScoreRing score={(1-(evalResult.nervousness??0.2))*5} label={composureLabel}/>
+                </div>
+
+                {/* Feature 4: 6-Axis Interactive Competency Radar Chart */}
+                <CompetencyRadarChart scores={{ ...evalResult.scores, nervousness: evalResult.nervousness }} size={240} />
 
             {/* Grade badge */}
             {evalResult.grade&&(
@@ -6424,6 +6581,8 @@ function PageLive({session,onFinish,addAnswer,replaceLastAnswer}){
                 )));
               }}
             />
+          </React.Fragment>
+        )}
 
             {/* ── DYNAMIC AI FOLLOW-UP & SENIOR PUSHBACK ── */}
             <div style={{marginTop:16,padding:"14px 16px",background:"rgba(139,92,246,0.06)",borderRadius:10,border:`1px solid ${G.purple}30`}}>
@@ -7912,7 +8071,32 @@ function PageReport({session,answers,incidents=[],onNav}){
           method:"POST",headers:{"Content-Type":"application/json"},
           body:JSON.stringify({session_id:session.sessionId,answers}),
         });
-        if(res.ok)setReport(await res.json());
+        if(res.ok){
+          const repData=await res.json();
+          setReport(repData);
+          if(getToken()){
+            try{
+              const avg=answers.length?answers.reduce((a,x)=>a+(x.score||3),0)/answers.length:0;
+              const avgNerv=answers.length?answers.reduce((a,x)=>a+(x.nervousness||0.2),0)/answers.length:0.2;
+              const avgStar=answers.length?answers.reduce((a,x)=>a+(x.star_coverage??0.5),0)/answers.length:0.5;
+              await authFetch(`${API}/user/history`,{
+                method:"POST",headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({
+                  session_id: session.sessionId,
+                  role: session.role,
+                  difficulty: session.difficulty,
+                  num_questions: session.numQuestions,
+                  avg_score: avg,
+                  avg_nervousness: avgNerv,
+                  avg_star: avgStar,
+                  hr_recommendation: repData.hr_recommendation || "Maybe",
+                  answers: answers,
+                  report: repData,
+                }),
+              });
+            }catch(err){console.warn("Auto-save history failed:", err);}
+          }
+        }
       }catch{}finally{setLoading(false);}
     })();
   },[]);
@@ -8883,6 +9067,49 @@ body{
           </Card>
         );
       })()}
+
+      {/* Phase 2: Resume Claim Evidence Grid */}
+      {report?.skill_evidence && Object.keys(report.skill_evidence).length > 0 && (
+        <Card style={{marginBottom:20,border:`1px solid ${G.violet}40`,background:G.glass,backdropFilter:G.blur}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+            <span style={{fontSize:20}}>🔬</span>
+            <div>
+              <div style={{fontFamily:G.head,fontSize:12,color:G.violet,fontWeight:700,letterSpacing:"0.1em"}}>
+                RESUME CLAIM EVIDENCE VERIFICATION
+              </div>
+              <div style={{fontSize:10,color:G.textMut}}>
+                5-level technical depth assessment of claimed resume capabilities
+              </div>
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
+            {Object.entries(report.skill_evidence).map(([skill, item]) => {
+              const evCol = item.evidence_level === "strong" ? G.green : item.evidence_level === "moderate" ? G.cyan : item.evidence_level === "limited" ? G.amber : G.textMut;
+              return (
+                <div key={skill} style={{padding:"12px 14px",borderRadius:8,background:"rgba(255,255,255,0.02)",border:`1px solid ${evCol}35`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <span style={{fontSize:13,fontWeight:700,color:G.textPri}}>{skill}</span>
+                    <span style={{fontSize:10,color:evCol,fontFamily:G.mono,padding:"2px 8px",borderRadius:99,background:`${evCol}15`,border:`1px solid ${evCol}30`}}>
+                      {item.evidence_label || "Not evaluated"}
+                    </span>
+                  </div>
+                  <div style={{fontSize:11,color:G.textMut,marginBottom:6}}>
+                    Questions Asked: {item.questions_asked || 0} {item.avg_score != null ? `· Avg Score: ${item.avg_score}/5` : ""}
+                  </div>
+                  {item.demonstrated_aspects && item.demonstrated_aspects.length > 0 && (
+                    <div style={{fontSize:10,color:G.green,display:"flex",gap:4,flexWrap:"wrap",marginTop:4}}>
+                      <span style={{color:G.textMut}}>Demonstrated:</span>
+                      {item.demonstrated_aspects.map(asp => (
+                        <span key={asp} style={{background:`${G.green}15`,padding:"1px 6px",borderRadius:4}}>✓ {asp}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
 
       <div style={{display:"flex",gap:14,justifyContent:"center",paddingBottom:28,flexWrap:"wrap"}}>
         <Btn onClick={()=>onNav("dashboard")} color={G.cyan} style={{padding:"11px 24px",borderRadius:8}}>← DASHBOARD</Btn>

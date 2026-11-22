@@ -95,6 +95,31 @@ from resume_rephraser_api import (
     DOCX_OK,
 )
 
+# ── Phase 2–5 modules ─────────────────────────────────────────────────────────
+from interview_memory import (
+    extract_memory_delta,
+    merge_memory,
+    empty_memory,
+    build_memory_context_string,
+)
+from claim_verifier import (
+    generate_claim_question,
+    get_skill_evidence_summary,
+    build_skill_evidence_registry,
+    update_skill_evidence,
+)
+from interview_planner import (
+    generate_interview_plan,
+    adapt_skill_difficulty,
+    select_followup_type,
+    get_followup_prompt_instruction,
+)
+from progress_tracker import (
+    get_skill_history,
+    detect_recurring_weaknesses,
+    generate_revision_plan,
+)
+
 _webcam_analyzer = WebcamNervousnessAnalyzer()
 
 # ── Unified Voice Pipeline (CNN+BiLSTM) ───────────────────────────────────────
@@ -833,6 +858,28 @@ async def user_history(
     return JSONResponse(content={"history": rows, "total_fetched": len(rows)})
 
 
+@app.post("/user/history")
+async def save_user_history(
+    req: SaveInterviewRequest,
+    current_user: TokenData = Depends(get_current_user),
+):
+    """Save an interview session to the authenticated user's history."""
+    record_id = save_interview(
+        user_id=current_user.user_id,
+        session_id=req.session_id,
+        role=req.role,
+        difficulty=req.difficulty,
+        num_questions=req.num_questions,
+        avg_score=req.avg_score,
+        avg_nervousness=req.avg_nervousness,
+        avg_star=req.avg_star,
+        hr_recommendation=req.hr_recommendation,
+        answers=req.answers,
+        report=req.report,
+    )
+    return JSONResponse(content={"status": "saved", "record_id": record_id})
+
+
 @app.get("/user/history/{record_id}")
 async def user_history_detail(
     record_id: str,
@@ -1445,6 +1492,8 @@ async def session_start(
     resume_text: str = Form(default=""),
     resume_parsed_json: str = Form(default=""),
     company_pack: str = Form(default=DEFAULT_COMPANY_PACK),   # v3.0: company style pack
+    mode: str = Form(default="practice"),                       # Phase 1: "practice" | "mock"
+    duration_minutes: int = Form(default=30),                   # Phase 3: interview duration
 ):
     """
     Create a new interview session.
@@ -1543,6 +1592,28 @@ async def session_start(
 
     # ── Initialise session state ───────────────────────────────────────────────
     _prune_sessions()
+
+    # Phase 2: build skill evidence registry from resume claims
+    resume_skills = []
+    try:
+        claims_raw = extract_resume_claims(resume_text) if resume_text.strip() else []
+        resume_skills = [c if isinstance(c, str) else str(c) for c in claims_raw]
+    except Exception:
+        resume_skills = []
+
+    # Phase 3: generate interview plan
+    interview_plan = {}
+    try:
+        interview_plan = generate_interview_plan(
+            role=role,
+            resume_text=resume_text,
+            duration_minutes=duration_minutes,
+            mode=mode,
+            num_questions=num_questions,
+        )
+    except Exception:
+        interview_plan = {}
+
     SESSIONS[session_id] = {
         "_created":         time.time(),
         "role":             role,
@@ -1551,6 +1622,7 @@ async def session_start(
         "resume_text":      resume_text,
         "resume_parsed":    parsed_resume_data or (parse_resume(resume_text) if resume_text.strip() else {}),
         "company_pack":     company_pack,                    # v3.0: stored for entire session
+        "mode":             mode if mode in ("practice", "mock") else "practice",  # Phase 1
         "answers":          [],
         "questions_asked":  [first_question.get("question", "")],
         "current_question": first_question,
@@ -1561,6 +1633,13 @@ async def session_start(
         "acoustic_baseline": None,    # AcousticBaseline; set by POST /baseline
         "facial_baseline":   None,    # dict; set by POST /baseline
         "created_at":       time.time(),
+        # Phase 2: Interview Memory
+        "memory":           empty_memory(),
+        "skill_evidence":   build_skill_evidence_registry(resume_skills),
+        "resume_skills":    resume_skills,
+        # Phase 3: Per-skill difficulty + plan
+        "interview_plan":   interview_plan,
+        "skill_difficulty": interview_plan.get("skill_difficulty", {}),
     }
 
     return JSONResponse(content={
@@ -1569,10 +1648,12 @@ async def session_start(
         "role":             role,
         "difficulty":       difficulty,
         "num_questions":    num_questions,
+        "mode":             mode,
         "rl_first_action":  first_action.label(),              # e.g. "technical/medium"
         "company_pack":     get_company_pack_info(company_pack),  # v3.0: echo pack info
         "syllabus":         get_syllabus(role),                # v3.0: full topic map for UI
         "syllabus_weights": get_syllabus_weights(role, company_pack),  # v3.0: adjusted weights
+        "interview_plan":   interview_plan.get("summary_text", ""),
     })
 
 
@@ -2082,6 +2163,126 @@ async def evaluate_answer(
 
     processing_ms = round((time.time() - start) * 1000)
 
+    # ── Phase 2: Extract interview memory from this answer ────────────────────
+    memory_delta: dict = {}
+    if session:
+        try:
+            memory_delta = extract_memory_delta(answer, question)
+            # Mark strengths / weak_topics based on score
+            if overall_score >= 4.0:
+                topic_key = q_type_raw
+                memory_delta.setdefault("strengths_added", [])
+                session["memory"].setdefault("strengths", [])
+                if topic_key not in session["memory"]["strengths"]:
+                    session["memory"]["strengths"].append(topic_key)
+            elif overall_score <= 2.5:
+                topic_key = q_type_raw
+                session["memory"].setdefault("weak_topics", [])
+                if topic_key not in session["memory"]["weak_topics"]:
+                    session["memory"]["weak_topics"].append(topic_key)
+            session["memory"] = merge_memory(session["memory"], memory_delta)
+        except Exception as _mem_err:
+            logger.warning(f"[evaluate] Memory extraction failed: {_mem_err}")
+
+    # ── Phase 3: Adapt per-skill difficulty ───────────────────────────────────
+    if session and q_type_raw:
+        try:
+            sd = session.get("skill_difficulty", {})
+            session["skill_difficulty"] = adapt_skill_difficulty(sd, q_type_raw, knowledge_score)
+        except Exception:
+            pass
+
+    # ── Phase 1: Generate spoken feedback (2–4 sentences) ────────────────────
+    spoken_feedback = ""
+    session_mode = session.get("mode", "practice") if session else "practice"
+    try:
+        # Determine top/bottom dimension from scores
+        dim_scores = {
+            "knowledge": knowledge_score,
+            "communication": emotion_score,
+            "fluency": voice_score,
+        }
+        top_dim = max(dim_scores, key=lambda k: dim_scores[k])
+        bot_dim = min(dim_scores, key=lambda k: dim_scores[k])
+        overall_10 = round(overall_score * 2, 1)  # scale 1–5 → 1–10
+
+        # Key strengths / improvements from AI evaluation
+        key_str = "; ".join((analysis.get("ai_evaluation", {}).get("key_strengths") or [])[:2]) or "your answer"
+        key_imp = "; ".join((analysis.get("ai_evaluation", {}).get("improvement_areas") or [])[:1]) or "depth and specificity"
+
+        if session_mode == "practice":
+            spoken_feedback = (
+                f"Your {top_dim} was your strongest point — {key_str}. "
+                f"To improve, focus on {key_imp}. "
+                f"Your overall score is {overall_10} out of 10. "
+            )
+            # Natural transition
+            if overall_score >= 4.0:
+                spoken_feedback += "Great answer — let's go deeper on this topic."
+            elif overall_score >= 3.0:
+                spoken_feedback += "Let's continue to the next question."
+            else:
+                spoken_feedback += "Let's move on and try to build on these areas."
+        else:
+            # Mock mode: no scores, natural reaction
+            if overall_score >= 4.0:
+                spoken_feedback = f"Good response. {key_str}. Let's explore this further."
+            elif overall_score >= 3.0:
+                spoken_feedback = f"That's reasonable. You covered the basics. Now let's go a bit deeper."
+            else:
+                spoken_feedback = f"Interesting. I'd like to hear more about {key_imp}. Let's continue."
+
+        # Clamp to reasonable length
+        if len(spoken_feedback) > 400:
+            spoken_feedback = spoken_feedback[:397] + "..."
+
+    except Exception as _sfb_err:
+        logger.warning(f"[evaluate] spoken_feedback generation failed: {_sfb_err}")
+        spoken_feedback = "Thank you for your answer. Let's continue."
+
+    # ── Phase 4: Answer coaching (structural diagnosis) ───────────────────────
+    answer_coach: dict = {}
+    try:
+        star_s = nlp_detail.get("star_scores", {})
+        if q_type in ("behavioural", "hr"):
+            answer_coach = {
+                "type": "STAR",
+                "components": {
+                    "Situation": bool(star_s.get("Situation")),
+                    "Task":      bool(star_s.get("Task")),
+                    "Action":    bool(star_s.get("Action")),
+                    "Result":    bool(star_s.get("Result")),
+                },
+                "completeness": round(star_cov * 100),
+                "suggestion": (
+                    "Your answer is missing the Result component — always quantify the outcome."
+                    if not star_s.get("Result")
+                    else "Your answer covers all STAR components well."
+                    if star_cov >= 0.75
+                    else "Strengthen the Task and Action components with more specific details."
+                ),
+            }
+        else:
+            answer_coach = {
+                "type": "TECHNICAL",
+                "components": {
+                    "Definition":  scores.get("relevance", 0) > 60,
+                    "Mechanics":   scores.get("depth", 0) > 2,
+                    "Example":     bool(re.search(r"\b(for example|e\.g\.|such as|instance|like)\b", answer, re.I)),
+                    "Trade-offs":  bool(re.search(r"\b(trade.off|disadvantage|downside|however|but|vs|versus)\b", answer, re.I)),
+                    "Complexity":  len(answer.split()) > 60,
+                },
+                "suggestion": (
+                    "Add a concrete real-world example to strengthen your answer."
+                    if not bool(re.search(r"\b(for example|e\.g\.|such as|instance)\b", answer, re.I))
+                    else "Consider discussing the trade-offs of your approach."
+                    if not bool(re.search(r"\b(trade.off|disadvantage|however|but|vs)\b", answer, re.I))
+                    else "Good technical depth — you're covering the key areas."
+                ),
+            }
+    except Exception:
+        pass
+
     return JSONResponse(content={
         # ── Core answer record ─────────────────────────────────────────────────
         **answer_record,
@@ -2217,6 +2418,16 @@ async def evaluate_answer(
         # ── Cross-question coherence (Feature 6) ──────────────────────────────
         # Populated from the 2nd answer onward; null on the first answer.
         "coherence_report": analysis.get("coherence_report", {"available": False}),
+
+        # ── Phase 1: Spoken feedback ──────────────────────────────────────────
+        "spoken_feedback":  spoken_feedback,
+        "session_mode":     session_mode,
+
+        # ── Phase 2: Interview memory delta ───────────────────────────────────
+        "memory_delta":     memory_delta,
+
+        # ── Phase 4: Answer coaching ──────────────────────────────────────────
+        "answer_coach":     answer_coach,
     })
 
 
@@ -2464,45 +2675,70 @@ class FollowUpRequest(BaseModel):
     question: str = ""
     answer: str = ""
     ideal_answer: Optional[str] = ""
+    session_id: Optional[str] = None      # Phase 3: used for memory context
+    follow_up_type: Optional[str] = None  # Phase 3: override taxonomy type
 
 
 @app.post("/followup")
 async def generate_followup(req: FollowUpRequest):
     """
     Generates a realistic Socratic interviewer follow-up / pushback probe.
-    Tests if candidate can defend trade-offs, handle counter-arguments,
-    or clarify ambiguities under pressure.
+    Phase 3: routes to one of 8 follow-up taxonomy types based on answer score.
     """
     q = (req.question or "").strip()
     ans = (req.answer or "").strip()
     role = req.role.strip()
     diff = req.difficulty.strip()
 
+    # Phase 3: determine follow-up type
+    followup_type = req.follow_up_type or "DEPTH"
+
+    # If session available, pick type from last answer score
+    if req.session_id:
+        session = SESSIONS.get(req.session_id, {})
+        last_answers = session.get("answers", [])
+        if last_answers:
+            last_score = last_answers[-1].get("score", 3.0)
+            q_type_ctx = last_answers[-1].get("question_type", "technical")
+            followup_type = select_followup_type(last_score, q_type_ctx, ans)
+
+    followup_instruction = get_followup_prompt_instruction(followup_type)
+
+    # Memory context for personalised references
+    memory_context = ""
+    if req.session_id:
+        session = SESSIONS.get(req.session_id, {})
+        memory = session.get("memory", {})
+        memory_context = build_memory_context_string(memory, max_chars=300)
+
     if analyzer.groq_client and len(ans) > 15:
+        mem_block = f"\n\nSession context (use to personalise follow-up):\n{memory_context}" if memory_context else ""
         prompt = (
             f"You are a seasoned Principal Engineer / Hiring Bar-Raiser interviewing a candidate for a {diff} {role} position.\n"
             f"The interview question asked: '{q}'\n"
-            f"The candidate answered: '{ans[:1600]}'\n\n"
-            "Challenge the candidate with ONE sharp, direct Socratic follow-up or pushback question.\n"
-            "- Challenge an unstated assumption, probe an edge-case failure mode, ask why they rejected an alternative, or probe deeper into scalability.\n"
-            "- Speak naturally like an attentive interviewer (e.g. 'You mentioned caching in Redis, but what happens if the cache stampede invalidates thousands of keys at midnight?').\n"
-            "- Return ONLY valid JSON: {\"follow_up\": \"...\", \"probe_reason\": \"...\", \"ideal_follow_up_answer\": \"...\"}"
+            f"The candidate answered: '{ans[:1600]}'\n"
+            f"Follow-up type to generate: {followup_type} — {followup_instruction}\n"
+            f"{mem_block}\n\n"
+            "Generate ONE sharp, natural follow-up question of the specified type.\n"
+            "Speak like an attentive interviewer. Reference specifics from their answer or prior session context.\n"
+            "Return ONLY valid JSON: {\"follow_up\": \"...\", \"probe_reason\": \"...\", \"follow_up_type\": \"...\", \"ideal_follow_up_answer\": \"...\"}"
         )
         try:
             resp = await analyzer.groq_client.chat.completions.create(
                 model=_GROQ_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are an expert technical interviewer challenging candidates with realistic follow-up pushbacks. Always return JSON."},
+                    {"role": "system", "content": "You are an expert technical interviewer. Always return JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.6,
-                max_tokens=350,
+                max_tokens=380,
             )
             raw = resp.choices[0].message.content.strip()
             from llm_router import clean_json_response
             out = json.loads(clean_json_response(raw))
             if isinstance(out, dict) and out.get("follow_up"):
                 out["source"] = "llm"
+                out["follow_up_type"] = followup_type
                 return out
         except Exception as exc:
             logger.warning("/followup LLM failed: %s: %s", type(exc).__name__, exc)
@@ -2511,6 +2747,7 @@ async def generate_followup(req: FollowUpRequest):
         "source": "fallback",
         "follow_up": f"Walk me through the failure modes of that approach: what trade-offs did you accept, and how would you monitor it under peak production traffic?",
         "probe_reason": "Testing architectural resilience and trade-off awareness.",
+        "follow_up_type": followup_type,
         "ideal_follow_up_answer": "A strong answer acknowledges trade-offs (e.g. latency vs consistency) and details metrics, circuit breakers, and automated failover."
     }
 
@@ -2779,6 +3016,12 @@ async def generate_report(body: ReportRequest):
         "resume_gap":        resume_gap,   # ← GapReport dict; {} if no resume
         # Feature 6 — cross-question thematic coherence (full session)
         "coherence_report":  compute_coherence_report(answers).to_dict(),
+        # Phases 1–3 data for comprehensive final report
+        "skill_evidence":    session.get("skill_evidence", {}),
+        "structured_memory": session.get("memory", {}),
+        "interview_mode":    session.get("mode", "practice"),
+        "interview_plan":    session.get("interview_plan", {}),
+        "skill_difficulty":  session.get("skill_difficulty", {}),
     })
 
 
@@ -3786,3 +4029,230 @@ async def benchmark_live_score(
         },
         "question": question,
     })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 2 — INTERVIEW MEMORY  &  CLAIM VERIFIER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/interview/memory")
+async def get_interview_memory(session_id: str):
+    """Return current session memory (technologies, projects, claims, etc.)."""
+    session = SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return JSONResponse(content={
+        "memory":         session.get("memory", {}),
+        "skill_evidence": session.get("skill_evidence", {}),
+        "skill_difficulty": session.get("skill_difficulty", {}),
+    })
+
+
+class ClaimQuestionRequest(BaseModel):
+    skill: str
+    level: int = 1
+    context: str = ""
+    custom_intro: str = ""
+
+
+@app.post("/interview/claim_question")
+async def claim_question(req: ClaimQuestionRequest):
+    """Generate a depth-N challenge question for a resume skill (Levels 1–5)."""
+    q = generate_claim_question(
+        skill=req.skill,
+        level=req.level,
+        context=req.context,
+        custom_intro=req.custom_intro,
+    )
+    return JSONResponse(content=q)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 3 — DYNAMIC INTERVIEW PLANNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PlanRequest(BaseModel):
+    role: str
+    resume_text: str = ""
+    jd_text: str = ""
+    duration_minutes: int = 30
+    mode: str = "practice"
+    num_questions: int = 10
+
+
+@app.post("/interview/plan")
+async def get_interview_plan(req: PlanRequest):
+    """Generate a pre-interview topic plan."""
+    plan = generate_interview_plan(
+        role=req.role,
+        resume_text=req.resume_text,
+        jd_text=req.jd_text,
+        duration_minutes=req.duration_minutes,
+        mode=req.mode,
+        num_questions=req.num_questions,
+    )
+    return JSONResponse(content=plan)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 4 — ANSWER IMPROVEMENT COACH
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CoachRequest(BaseModel):
+    question: str
+    answer: str
+    question_type: str = "technical"
+    overall_score: float = 3.0
+    star_scores: dict = {}
+    key_strengths: list = []
+    improvement_areas: list = []
+
+
+@app.post("/answer/coach")
+async def answer_coach(req: CoachRequest):
+    """
+    Phase 4: Return actionable coaching for a submitted answer.
+    - Behavioural: STAR completeness checklist
+    - Technical: Definition / Mechanics / Example / Trade-offs / Complexity
+    - 2–3 actionable improvement sentences
+    """
+    q_lower = req.question_type.lower()
+
+    if "behavioural" in q_lower or "behavioral" in q_lower or "hr" in q_lower:
+        star = req.star_scores
+        checklist = {
+            "Situation": bool(star.get("Situation")),
+            "Task":      bool(star.get("Task")),
+            "Action":    bool(star.get("Action")),
+            "Result":    bool(star.get("Result")),
+        }
+        missing = [k for k, v in checklist.items() if not v]
+        completeness = round(sum(1 for v in checklist.values() if v) / 4 * 100)
+
+        if missing:
+            suggestion = f"Your answer is missing the {' and '.join(missing)} component(s). "
+            if "Result" in missing:
+                suggestion += "Always close with a measurable outcome or business impact."
+            else:
+                suggestion += "Be more explicit about each STAR component."
+        else:
+            suggestion = "Your answer covers all STAR components. For higher scores, quantify your results (e.g., '20% faster', 'reduced errors by half')."
+
+        return JSONResponse(content={
+            "type": "STAR",
+            "checklist": checklist,
+            "completeness_pct": completeness,
+            "suggestion": suggestion,
+            "missing_components": missing,
+            "retry_tip": "In your retry, explicitly label each part: Situation → Task → Action → Result.",
+        })
+    else:
+        # Technical checklist
+        answer_text = req.answer
+        has_example = bool(re.search(r"\b(for example|e\.g\.|such as|instance|like)\b", answer_text, re.I))
+        has_tradeoff = bool(re.search(r"\b(trade.off|disadvantage|downside|however|but|vs|versus|cons|pros)\b", answer_text, re.I))
+        is_deep = len(answer_text.split()) > 60
+        is_relevant = req.overall_score >= 3.0
+        has_complexity = bool(re.search(r"\b(O\(|complexity|performance|efficient|scale)\b", answer_text))
+
+        checklist = {
+            "Definition / Concept": is_relevant,
+            "Internal Mechanics":   is_deep,
+            "Real-world Example":   has_example,
+            "Trade-offs / Cons":    has_tradeoff,
+            "Scale / Complexity":   has_complexity,
+        }
+        missing = [k for k, v in checklist.items() if not v]
+        completeness = round(sum(1 for v in checklist.values() if v) / 5 * 100)
+
+        if not has_example:
+            suggestion = "Add a concrete real-world example from your experience to make the answer memorable."
+        elif not has_tradeoff:
+            suggestion = "Mention at least one trade-off or limitation of your approach to show deeper understanding."
+        elif not has_complexity:
+            suggestion = "Briefly address performance or scaling considerations to show systems-level thinking."
+        else:
+            suggestion = "Strong technical answer. For even higher scores, be more precise about implementation details."
+
+        # Try to get an LLM-enhanced suggestion
+        if analyzer.groq_client and req.answer and len(req.answer) > 50:
+            try:
+                lp = (
+                    f"Interview question: '{req.question}'\n"
+                    f"Candidate answer: '{req.answer[:1000]}'\n"
+                    f"Overall score: {req.overall_score}/5. Missing elements: {missing}.\n\n"
+                    "In exactly 2 sentences, tell the candidate what specific content to add in a retry. Be concrete and actionable. No praise."
+                )
+                lr = await analyzer.groq_client.chat.completions.create(
+                    model=_GROQ_MODEL,
+                    messages=[{"role": "user", "content": lp}],
+                    temperature=0.4,
+                    max_tokens=120,
+                )
+                llm_sug = lr.choices[0].message.content.strip()
+                if llm_sug:
+                    suggestion = llm_sug
+            except Exception:
+                pass
+
+        return JSONResponse(content={
+            "type": "TECHNICAL",
+            "checklist": checklist,
+            "completeness_pct": completeness,
+            "suggestion": suggestion,
+            "missing_components": missing,
+            "retry_tip": "In your retry, structure your answer as: define it → explain mechanics → give an example → state trade-offs.",
+        })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHASE 5 — PROGRESS TRACKER  &  REVISION PLAN
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/user/progress")
+async def user_progress(current_user: TokenData = Depends(get_current_user)):
+    """
+    Phase 5: Return multi-session skill progress and recurring weaknesses.
+    Requires JWT authentication.
+    """
+    user_id = str(current_user.user_id)
+    skill_history = get_skill_history(user_id)
+    weaknesses = detect_recurring_weaknesses(skill_history)
+
+    # Aggregate strong skills (avg ≥ 3.8 across ≥ 2 sessions)
+    strengths = [
+        skill for skill, scores in skill_history.items()
+        if len(scores) >= 2 and sum(scores) / len(scores) >= 3.8
+    ]
+
+    return JSONResponse(content={
+        "skill_history":    skill_history,
+        "recurring_weaknesses": weaknesses,
+        "strengths":        strengths,
+        "total_sessions":   len(set(
+            # approximate unique sessions from score list lengths
+        )),
+    })
+
+
+@app.post("/user/revision_plan")
+async def user_revision_plan(current_user: TokenData = Depends(get_current_user)):
+    """
+    Phase 5: Generate a 7-day personalised revision plan based on recurring weaknesses.
+    """
+    user_id = str(current_user.user_id)
+    skill_history = get_skill_history(user_id)
+    weaknesses = detect_recurring_weaknesses(skill_history)
+    strengths = [
+        s for s, scores in skill_history.items()
+        if len(scores) >= 2 and sum(scores) / len(scores) >= 3.8
+    ]
+
+    if not weaknesses:
+        return JSONResponse(content={
+            "message": "No recurring weaknesses detected. Keep practising to generate more data.",
+            "plan": {},
+        })
+
+    plan = generate_revision_plan(weaknesses, strengths)
+    return JSONResponse(content=plan)
